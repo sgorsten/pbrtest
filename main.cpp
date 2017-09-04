@@ -20,6 +20,30 @@ struct camera
     void move_local(const float3 & displacement) { position += qrot(get_orientation(), displacement); }
 };
 
+void draw_sphere(int slices, int stacks, float radius)
+{
+    const auto draw_vertex = [slices, stacks, radius](int i, int j)
+    {
+        const float tau = 6.2831853f, longitude = i*tau/slices, latitude = (j-(stacks*0.5f))*tau/2/stacks;
+        const float3 p {cos(longitude)*cos(latitude), sin(latitude), sin(longitude)*cos(latitude)}; // Poles at +/-y
+        glVertexAttrib3f(1, p.x, p.y, p.z);
+        glVertex3f(p.x*radius, p.y*radius, p.z*radius);
+    };
+
+    glBegin(GL_QUADS);
+    for(int i=0; i<slices; ++i)
+    {
+        for(int j=0; j<stacks; ++j)
+        {
+            draw_vertex(i,j);
+            draw_vertex(i,j+1);
+            draw_vertex(i+1,j+1);
+            draw_vertex(i+1,j);
+        }
+    }
+    glEnd();
+}
+
 int main()
 {
     glfwInit();
@@ -73,11 +97,7 @@ int main()
         glLoadIdentity();
         glLoadMatrixf(&view_proj_matrix[0][0]);
 
-        glBegin(GL_TRIANGLES);
-        glVertex3f(-0.5f,+0.5f,0);
-        glVertex3f(+0.5f,+0.5f,0);        
-        glVertex3f( 0.0f,-0.5f,0);
-        glEnd();
+        draw_sphere(32,16,0.5f);
 
         glfwSwapBuffers(win);
     }
