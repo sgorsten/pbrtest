@@ -1,13 +1,35 @@
-#define GLEW_STATIC
-#include "3rdparty/glew/include/GL/glew.h"
-#include "3rdparty/glfw/include/GLFW/glfw3.h"
-#pragma comment(lib, "opengl32.lib")
-
+#include <vector>
+#include <iostream>
+#include <string_view>
 #include <chrono>
 using hr_clock = std::chrono::high_resolution_clock;
 
 #include "3rdparty/linalg.h"
 using namespace linalg::aliases;
+
+#define GLEW_STATIC
+#include "3rdparty/glew/include/GL/glew.h"
+#include "3rdparty/glfw/include/GLFW/glfw3.h"
+#pragma comment(lib, "opengl32.lib")
+
+constexpr char vert_shader_source[] = R"(#version 420
+uniform mat4 u_transform;
+layout(location=0) in vec3 v_position;
+layout(location=1) in vec3 v_normal;
+layout(location=0) out vec3 normal;
+void main()
+{
+    normal = v_normal;
+    gl_Position = u_transform * vec4(v_position,1);
+})";
+
+constexpr char frag_shader_source[] = R"(#version 420
+layout(location=0) in vec3 normal;
+void main() 
+{ 
+    float diffuse = max(dot(normal, vec3(0,-1,0)), 0);
+    gl_FragColor = vec4(diffuse,0,0,1);
+})";
 
 struct camera
 {
@@ -44,13 +66,65 @@ void draw_sphere(int slices, int stacks, float radius)
     glEnd();
 }
 
-int main()
+GLuint compile_shader(GLenum type, std::string_view source)
+{
+    const GLuint shader = glCreateShader(type);
+    const GLchar * string = source.data();
+    const GLint length = source.size();
+    glShaderSource(shader, 1, &string, &length);
+    glCompileShader(shader);
+
+    GLint compile_status;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compile_status);
+    if(compile_status != GL_TRUE)
+    {
+        GLint info_log_length;
+        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &info_log_length);
+
+        std::vector<GLchar> info_log(info_log_length);
+        glGetShaderInfoLog(shader, info_log.size(), nullptr, info_log.data());
+        glDeleteShader(shader);
+        throw std::runtime_error(info_log.data());
+    }
+
+    return shader;
+}
+
+GLuint link_program(std::initializer_list<GLuint> shader_stages)
+{
+    const GLuint program = glCreateProgram();
+    for(auto shader : shader_stages) glAttachShader(program, shader);
+    glLinkProgram(program);
+
+    GLint link_status;
+    glGetProgramiv(program, GL_LINK_STATUS, &link_status);
+    if(link_status != GL_TRUE)
+    {
+        GLint info_log_length;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &info_log_length);
+
+        std::vector<GLchar> info_log(info_log_length);
+        glGetProgramInfoLog(program, info_log.size(), nullptr, info_log.data());
+        glDeleteProgram(program);
+        throw std::runtime_error(info_log.data());
+    }
+
+    return program;
+}
+
+int main() try
 {
     glfwInit();
 
     auto win = glfwCreateWindow(1280, 720, "PBR Test", nullptr, nullptr);
     glfwMakeContextCurrent(win);
+    glfwSwapInterval(1);
+
     glewInit();
+
+    auto vert_shader = compile_shader(GL_VERTEX_SHADER, vert_shader_source);
+    auto frag_shader = compile_shader(GL_FRAGMENT_SHADER, frag_shader_source);
+    auto prog = link_program({vert_shader, frag_shader});
 
     // Set up a right-handed, x-right, y-down, z-forward coordinate system with a 0-to-1 depth buffer
     glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
@@ -94,14 +168,30 @@ int main()
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        glLoadIdentity();
-        glLoadMatrixf(&view_proj_matrix[0][0]);
+        glUseProgram(prog);
 
-        draw_sphere(32,16,0.5f);
+        for(int i=0; i<7; ++i)
+        {
+            for(int j=0; j<7; ++j)
+            {
+                const float3 position {j-3.0f, i-3.0f, 0.0f};
+                const float4x4 model_matrix = translation_matrix(position);
+                const float4x4 model_view_proj_matrix = mul(view_proj_matrix, model_matrix);
+                glUniformMatrix4fv(0, 1, GL_FALSE, &model_view_proj_matrix[0][0]);
+
+                draw_sphere(32,16,0.4f);
+            }
+        }       
 
         glfwSwapBuffers(win);
     }
 
     glfwDestroyWindow(win);
     glfwTerminate();
+    return EXIT_SUCCESS;
+}
+catch(const std::exception & e)
+{
+    std::cerr << e.what() << std::endl;
+    return EXIT_FAILURE;
 }
