@@ -42,28 +42,28 @@ struct camera
     void move_local(const float3 & displacement) { position += qrot(get_orientation(), displacement); }
 };
 
-void draw_sphere(int slices, int stacks, float radius)
+struct vertex { float3 position, normal; };
+std::vector<vertex> make_sphere(int slices, int stacks, float radius)
 {
-    const auto draw_vertex = [slices, stacks, radius](int i, int j)
+    const auto make_vertex = [slices, stacks, radius](int i, int j)
     {
         const float tau = 6.2831853f, longitude = i*tau/slices, latitude = (j-(stacks*0.5f))*tau/2/stacks;
-        const float3 p {cos(longitude)*cos(latitude), sin(latitude), sin(longitude)*cos(latitude)}; // Poles at +/-y
-        glVertexAttrib3f(1, p.x, p.y, p.z);
-        glVertex3f(p.x*radius, p.y*radius, p.z*radius);
+        const float3 normal {cos(longitude)*cos(latitude), sin(latitude), sin(longitude)*cos(latitude)}; // Poles at +/-y
+        return vertex{normal*radius, normal};
     };
 
-    glBegin(GL_QUADS);
+    std::vector<vertex> vertices;
     for(int i=0; i<slices; ++i)
     {
         for(int j=0; j<stacks; ++j)
         {
-            draw_vertex(i,j);
-            draw_vertex(i,j+1);
-            draw_vertex(i+1,j+1);
-            draw_vertex(i+1,j);
+            vertices.push_back(make_vertex(i,j));
+            vertices.push_back(make_vertex(i,j+1));
+            vertices.push_back(make_vertex(i+1,j+1));
+            vertices.push_back(make_vertex(i+1,j));
         }
     }
-    glEnd();
+    return vertices;
 }
 
 GLuint compile_shader(GLenum type, std::string_view source)
@@ -114,6 +114,8 @@ GLuint link_program(std::initializer_list<GLuint> shader_stages)
 
 int main() try
 {
+    auto sphere_verts = make_sphere(32,16,0.4f);
+
     glfwInit();
 
     auto win = glfwCreateWindow(1280, 720, "PBR Test", nullptr, nullptr);
@@ -131,9 +133,10 @@ int main() try
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
     glFrontFace(GL_CW); // Still actually counter-clockwise
+    glEnable(GL_DEPTH_TEST);
 
-    const float cam_speed = 4;
-    camera cam {{0,0,-5}};
+    const float cam_speed = 8;
+    camera cam {{0,0,-8}};
 
     double2 prev_cursor;
     glfwGetCursorPos(win, &prev_cursor.x, &prev_cursor.y);
@@ -163,7 +166,7 @@ int main() try
         if(length(move) > 0) cam.move_local(normalize(move) * (cam_speed * timestep));
 
         const float4x4 view_matrix = cam.get_view_matrix();
-        const float4x4 proj_matrix = linalg::perspective_matrix(1.0f, (float)1280/720, 0.1f, 10.0f, linalg::pos_z, linalg::zero_to_one);
+        const float4x4 proj_matrix = linalg::perspective_matrix(1.0f, (float)1280/720, 0.1f, 32.0f, linalg::pos_z, linalg::zero_to_one);
         const float4x4 view_proj_matrix = mul(proj_matrix, view_matrix);
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -179,7 +182,11 @@ int main() try
                 const float4x4 model_view_proj_matrix = mul(view_proj_matrix, model_matrix);
                 glUniformMatrix4fv(0, 1, GL_FALSE, &model_view_proj_matrix[0][0]);
 
-                draw_sphere(32,16,0.4f);
+                glEnableVertexAttribArray(0);
+                glEnableVertexAttribArray(1);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().position[0]);
+                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().normal[0]);
+                glDrawArrays(GL_QUADS, 0, sphere_verts.size());
             }
         }       
 
