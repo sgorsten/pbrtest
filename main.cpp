@@ -13,22 +13,104 @@ using namespace linalg::aliases;
 #pragma comment(lib, "opengl32.lib")
 
 constexpr char vert_shader_source[] = R"(#version 420
-uniform mat4 u_transform;
+uniform mat4 u_view_proj_matrix;
+uniform mat4 u_model_matrix;
 layout(location=0) in vec3 v_position;
 layout(location=1) in vec3 v_normal;
-layout(location=0) out vec3 normal;
+layout(location=0) out vec3 position;
+layout(location=1) out vec3 normal;
 void main()
 {
-    normal = v_normal;
-    gl_Position = u_transform * vec4(v_position,1);
+    position    = (u_model_matrix * vec4(v_position,1)).xyz;
+    normal      = (u_model_matrix * vec4(v_normal,0)).xyz;
+    gl_Position = u_view_proj_matrix * vec4(position,1);
 })";
 
 constexpr char frag_shader_source[] = R"(#version 420
-layout(location=0) in vec3 normal;
+uniform vec3  u_eye_position;
+uniform vec3  u_albedo;
+uniform float u_metalness;
+uniform float u_roughness;
+uniform float u_ambient_occlusion;
+layout(location=0) in vec3 position;
+layout(location=1) in vec3 normal;
+
+const float PI = 3.1415927;
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+float DistributionGGX(vec3 N, vec3 H, float roughness)
+{
+    float a      = roughness*roughness;
+    float a2     = a*a;
+    float NdotH  = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH*NdotH;
+	
+    float nom   = a2;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    denom = PI * denom * denom;
+	
+    return nom / denom;
+}
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = (roughness + 1.0);
+    float k = (r*r) / 8.0;
+
+    float nom   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+	
+    return nom / denom;
+}
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx2  = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1  = GeometrySchlickGGX(NdotL, roughness);
+	
+    return ggx1 * ggx2;
+}
+
 void main() 
 { 
-    float diffuse = max(dot(normal, vec3(0,-1,0)), 0);
-    gl_FragColor = vec4(diffuse,0,0,1);
+    vec3 N = normalize(normal); 
+    vec3 V = normalize(u_eye_position - position);
+
+    vec3 light_position = vec3(0, 0, -4);
+    vec3 light_color    = vec3(23.47, 21.31, 20.79);
+
+    vec3 L = normalize(light_position - position);
+    vec3 H = normalize(V + L);
+    
+    float distance    = length(light_position - position);
+    float attenuation = 1.0 / (distance * distance);
+    vec3 radiance     = light_color * attenuation; 
+
+    vec3 F0 = vec3(0.04); 
+    F0      = mix(F0, u_albedo, u_metalness);
+    vec3 F  = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+    float NDF = DistributionGGX(N, H, u_roughness);       
+    float G   = GeometrySmith(N, V, L, u_roughness);   
+
+    vec3 nominator    = NDF * G * F;
+    float denominator = 4 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.001; 
+    vec3 specular     = nominator / denominator;  
+
+    vec3 kS = F;
+    vec3 kD = vec3(1.0) - kS;
+  
+    kD *= 1.0 - u_metalness;	
+
+    const float PI = 3.14159265359;
+  
+    float NdotL = max(dot(N, L), 0.0);        
+    gl_FragColor = vec4((kD * u_albedo / PI + specular) * radiance * NdotL, 1);
 })";
 
 struct camera
@@ -118,6 +200,7 @@ int main() try
 
     glfwInit();
 
+    glfwWindowHint(GLFW_SRGB_CAPABLE, GLFW_TRUE);
     auto win = glfwCreateWindow(1280, 720, "PBR Test", nullptr, nullptr);
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -134,6 +217,7 @@ int main() try
     glCullFace(GL_BACK);
     glFrontFace(GL_CW); // Still actually counter-clockwise
     glEnable(GL_DEPTH_TEST);
+    glEnable(GL_FRAMEBUFFER_SRGB);
 
     const float cam_speed = 8;
     camera cam {{0,0,-8}};
@@ -169,18 +253,26 @@ int main() try
         const float4x4 proj_matrix = linalg::perspective_matrix(1.0f, (float)1280/720, 0.1f, 32.0f, linalg::pos_z, linalg::zero_to_one);
         const float4x4 view_proj_matrix = mul(proj_matrix, view_matrix);
 
+        glClearColor(0.5f,0.5f,0.5f,1);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glUseProgram(prog);
+        glUniformMatrix4fv(glGetUniformLocation(prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+        glUniform3fv(glGetUniformLocation(prog, "u_eye_position"), 1, &cam.position[0]);
 
+        const float3 albedo {1,0,0};
+        glUniform3fv(glGetUniformLocation(prog, "u_albedo"), 1, &albedo[0]);
+        glUniform1f(glGetUniformLocation(prog, "u_ambient_occlusion"), 1.0f);
         for(int i=0; i<7; ++i)
         {
             for(int j=0; j<7; ++j)
             {
                 const float3 position {j-3.0f, i-3.0f, 0.0f};
                 const float4x4 model_matrix = translation_matrix(position);
-                const float4x4 model_view_proj_matrix = mul(view_proj_matrix, model_matrix);
-                glUniformMatrix4fv(0, 1, GL_FALSE, &model_view_proj_matrix[0][0]);
+                glUniformMatrix4fv(glGetUniformLocation(prog, "u_model_matrix"), 1, GL_FALSE, &model_matrix[0][0]);
+
+                glUniform1f(glGetUniformLocation(prog, "u_metalness"), 1-(i+0.5f)/7);
+                glUniform1f(glGetUniformLocation(prog, "u_roughness"), (j+0.5f)/7);
 
                 glEnableVertexAttribArray(0);
                 glEnableVertexAttribArray(1);
