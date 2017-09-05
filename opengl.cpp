@@ -382,19 +382,22 @@ pbr_tools::pbr_tools()
 
 template<class F> GLuint render_cubemap(GLsizei levels, GLenum internal_format, GLsizei width, F draw_face)
 {
+    // If user passes levels == 0, let the user draw level 1 and have OpenGL generate a mip chain
+    GLsizei user_levels = levels ? levels : 1;
+
     GLuint cubemap;
     glCreateTextures(GL_TEXTURE_CUBE_MAP, 1, &cubemap);
-    glTextureStorage2D(cubemap, levels, internal_format, width, width);
+    glTextureStorage2D(cubemap, levels ? levels : 1+static_cast<GLsizei>(std::ceil(std::log2(width))), internal_format, width, width);
     glTextureParameteri(cubemap, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTextureParameteri(cubemap, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTextureParameteri(cubemap, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-    glTextureParameteri(cubemap, GL_TEXTURE_MIN_FILTER, levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+    glTextureParameteri(cubemap, GL_TEXTURE_MIN_FILTER, levels == 1 ? GL_LINEAR : GL_LINEAR_MIPMAP_LINEAR);
     glTextureParameteri(cubemap, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     GLuint fbo;
     glCreateFramebuffers(1, &fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
-    for(GLint mip=0; mip<levels; ++mip)
+    for(GLint mip=0; mip<user_levels; ++mip)
     {
         glViewport(0, 0, width, width);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X, cubemap, mip); draw_face(float4x4{{0,0,+1,0},{0,+1,0,0},{-1,0,0,0},{0,0,0,1}}, mip);
@@ -407,6 +410,8 @@ template<class F> GLuint render_cubemap(GLsizei levels, GLenum internal_format, 
     }
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &fbo);
+
+    if(levels == 0) glGenerateTextureMipmap(cubemap);
     return cubemap; 
 }
 
@@ -424,7 +429,7 @@ GLuint pbr_tools::convert_spheremap_to_cubemap(GLenum internal_format, GLsizei w
 {
     glUseProgram(spheremap_skybox_prog);
     glBindTexture(GL_TEXTURE_2D, spheremap);
-    return render_cubemap(1, internal_format, width, [&](const float4x4 & view_proj_matrix, int mip)
+    return render_cubemap(0, internal_format, width, [&](const float4x4 & view_proj_matrix, int mip)
     {        
         glUniformMatrix4fv(glGetUniformLocation(spheremap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
         glBegin(GL_QUADS);
