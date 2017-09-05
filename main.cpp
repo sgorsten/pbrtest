@@ -7,12 +7,41 @@ using hr_clock = std::chrono::high_resolution_clock;
 #include "3rdparty/linalg.h"
 using namespace linalg::aliases;
 
-#define GLEW_STATIC
-#include "3rdparty/glew/include/GL/glew.h"
-#include "3rdparty/glfw/include/GLFW/glfw3.h"
-#pragma comment(lib, "opengl32.lib")
+#include "opengl.h"
 
-constexpr char vert_shader_source[] = R"(#version 420
+constexpr char skybox_vert_shader_source[] = R"(
+uniform mat4 u_view_proj_matrix;
+layout(location=0) in vec3 v_direction;
+layout(location=0) out vec3 direction;
+void main()
+{
+    direction   = v_direction;
+    gl_Position = u_view_proj_matrix * vec4(direction,1);
+})";
+
+constexpr char spheremap_skybox_frag_shader_source[] = R"(
+layout(location=0) uniform sampler2D u_texture;
+layout(location=0) in vec3 direction;
+layout(location=0) out vec4 f_color;
+vec2 compute_spherical_texcoords(vec3 direction)
+{
+    return vec2(atan(direction.x, direction.z)*0.1591549, asin(direction.y)*0.3183099 + 0.5);
+}
+void main()
+{
+    f_color = texture(u_texture, compute_spherical_texcoords(normalize(direction)));
+})";
+
+constexpr char cubemap_skybox_frag_shader_source[] = R"(
+layout(location=0) uniform samplerCube u_texture;
+layout(location=0) in vec3 direction;
+layout(location=0) out vec4 f_color;
+void main()
+{
+    f_color = texture(u_texture, direction);
+})";
+
+constexpr char vert_shader_source[] = R"(
 uniform mat4 u_view_proj_matrix;
 uniform mat4 u_model_matrix;
 layout(location=0) in vec3 v_position;
@@ -26,82 +55,7 @@ void main()
     gl_Position = u_view_proj_matrix * vec4(position,1);
 })";
 
-constexpr char frag_shader_source[] = R"(#version 420
-const float PI = 3.14159265359;
-
-// This structure contains the essential information about a fragment to compute lighting for it
-struct pbr_surface
-{
-    vec3 normal_vec;        // unit vector perpendicular to the surface
-    vec3 eye_vec;           // unit vector pointing from the surface to the viewer
-    float n_dot_v;          // max(dot(normal_vec, eye_vec), 0)
-    vec3 diffuse_albedo;    // (1-metalness) * albedo/PI
-    vec3 base_reflectivity; // F0
-    float alpha;            // roughness^2
-    float k;                // computed different for direct and indirect lighting
-};
-
-// This function computes the contribution of a single light to a fragment
-vec3 compute_contribution(pbr_surface surf, vec3 light_vec, vec3 radiance)
-{
-    // Compute half vector and precompute some dot products
-    vec3 half_vec = normalize(surf.eye_vec + light_vec);
-    float n_dot_l = max(dot(surf.normal_vec, light_vec), 0);
-    float n_dot_h = max(dot(surf.normal_vec, half_vec), 0);    
-    float v_dot_h = max(dot(surf.eye_vec, half_vec), 0);
-
-    // Evaluate Trowbridge-Reitz GGX normal distribution function
-    float denom = n_dot_h*n_dot_h*(surf.alpha*surf.alpha-1) + 1;
-    denom = PI * denom * denom;
-    float D = (surf.alpha*surf.alpha) / denom;
-
-    // Evaluate Smith's Schlick-GGX geometry function
-    float ggx1 = n_dot_l / (n_dot_l*(1-surf.k) + surf.k);
-    float ggx2 = surf.n_dot_v / (surf.n_dot_v*(1-surf.k) + surf.k);
-    float G = ggx1 * ggx2;
-
-    // Evaluate Fresnel-Schlick approximation to Fresnel equation
-    vec3 F = surf.base_reflectivity + (1-surf.base_reflectivity) * pow(1-v_dot_h, 5);
-
-    // Evaluate Cook-Torrance specular BRDF
-    vec3 specular = (D * G * F) / (4 * surf.n_dot_v * n_dot_l + 0.001);  
-
-    // Compute diffuse contribution
-    vec3 diffuse = (1-F) * surf.diffuse_albedo;
-
-    // Return total contribution from this light
-    return (diffuse + specular) * radiance * n_dot_l;
-}
-
-// This function computes the full lighting to apply to a single fragment
-uniform vec3 u_eye_position;
-vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, float metalness, float ambient_occlusion)
-{
-    pbr_surface surf;
-    surf.normal_vec = normalize(normal);
-    surf.eye_vec = normalize(u_eye_position - position);
-    surf.n_dot_v = max(dot(surf.normal_vec, surf.eye_vec), 0);
-    surf.base_reflectivity = mix(vec3(0.04), albedo, metalness);
-    surf.diffuse_albedo = (1-metalness) * albedo/PI;
-    surf.alpha = roughness*roughness;
-    surf.k = (roughness+1)*(roughness+1)/8;
-
-    // Initialize ambient light amount
-    vec3 light = vec3(0.03) * albedo * ambient_occlusion;
-
-    // Add contributions from point lights
-    vec3 light_positions[4] = {vec3(-2, -2, -8), vec3(2, -2, -8), vec3(2, 2, -8), vec3(-2, 2, -8)};
-    vec3 light_colors[4] = {vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79)};
-    for(int i=0; i<4; ++i)
-    {
-        vec3 L = normalize(light_positions[i] - position);
-        float distance = length(light_positions[i] - position);
-        vec3 radiance  = light_colors[i] / (distance * distance); 
-        light += compute_contribution(surf, L, radiance);
-    }
-    return light;
-}
-
+constexpr char frag_shader_source[] = R"(
 // Fragment shader for untextured PBR surface
 uniform vec3 u_albedo;
 uniform float u_roughness;
@@ -154,55 +108,21 @@ std::vector<vertex> make_sphere(int slices, int stacks, float radius)
     return vertices;
 }
 
-GLuint compile_shader(GLenum type, std::string_view source)
-{
-    const GLuint shader = glCreateShader(type);
-    const GLchar * string = source.data();
-    const GLint length = source.size();
-    glShaderSource(shader, 1, &string, &length);
-    glCompileShader(shader);
-
-    GLint compile_status;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &compile_status);
-    if(compile_status != GL_TRUE)
-    {
-        GLint info_log_length;
-        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &info_log_length);
-
-        std::vector<GLchar> info_log(info_log_length);
-        glGetShaderInfoLog(shader, info_log.size(), nullptr, info_log.data());
-        glDeleteShader(shader);
-        throw std::runtime_error(info_log.data());
-    }
-
-    return shader;
-}
-
-GLuint link_program(std::initializer_list<GLuint> shader_stages)
-{
-    const GLuint program = glCreateProgram();
-    for(auto shader : shader_stages) glAttachShader(program, shader);
-    glLinkProgram(program);
-
-    GLint link_status;
-    glGetProgramiv(program, GL_LINK_STATUS, &link_status);
-    if(link_status != GL_TRUE)
-    {
-        GLint info_log_length;
-        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &info_log_length);
-
-        std::vector<GLchar> info_log(info_log_length);
-        glGetProgramInfoLog(program, info_log.size(), nullptr, info_log.data());
-        glDeleteProgram(program);
-        throw std::runtime_error(info_log.data());
-    }
-
-    return program;
-}
+#define STB_IMAGE_IMPLEMENTATION
+#include "3rdparty/stb_image.h"
 
 int main() try
 {
     auto sphere_verts = make_sphere(32,16,0.4f);
+    constexpr float3 skybox_verts[]
+    {
+        {-1,-1,-1}, {-1,+1,-1}, {-1,+1,+1}, {-1,-1,+1},
+        {+1,-1,-1}, {+1,-1,+1}, {+1,+1,+1}, {+1,+1,-1},
+        {-1,-1,-1}, {-1,-1,+1}, {+1,-1,+1}, {+1,-1,-1},
+        {-1,+1,-1}, {+1,+1,-1}, {+1,+1,+1}, {-1,+1,+1},
+        {-1,-1,-1}, {+1,-1,-1}, {+1,+1,-1}, {-1,+1,-1},
+        {-1,-1,+1}, {-1,+1,+1}, {+1,+1,+1}, {+1,-1,+1}
+    };
 
     glfwInit();
 
@@ -214,9 +134,15 @@ int main() try
 
     glewInit();
 
-    auto vert_shader = compile_shader(GL_VERTEX_SHADER, vert_shader_source);
-    auto frag_shader = compile_shader(GL_FRAGMENT_SHADER, frag_shader_source);
+    auto vert_shader = compile_shader(GL_VERTEX_SHADER, {preamble, vert_shader_source});
+    auto frag_shader = compile_shader(GL_FRAGMENT_SHADER, {preamble, pbr_lighting, frag_shader_source});
     auto prog = link_program({vert_shader, frag_shader});
+
+    auto skybox_vert_shader = compile_shader(GL_VERTEX_SHADER, {preamble, skybox_vert_shader_source});
+    auto spheremap_skybox_frag_shader = compile_shader(GL_FRAGMENT_SHADER, {preamble, spheremap_skybox_frag_shader_source});
+    auto spheremap_skybox_prog = link_program({skybox_vert_shader, spheremap_skybox_frag_shader});
+    auto cubemap_skybox_frag_shader = compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_skybox_frag_shader_source});
+    auto cubemap_skybox_prog = link_program({skybox_vert_shader, cubemap_skybox_frag_shader});
 
     // Set up a right-handed, x-right, y-down, z-forward coordinate system with a 0-to-1 depth buffer
     glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
@@ -227,9 +153,57 @@ int main() try
     glEnable(GL_FRAMEBUFFER_SRGB);
     glEnable(GL_MULTISAMPLE);
 
+    int width, height;
+    float * pixels = stbi_loadf("monument-valley.hdr", &width, &height, nullptr, 3);
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGB, GL_FLOAT, pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    stbi_image_free(pixels);
+
+    // Convert spheremap to cubemap
+    GLuint fbo, cubemap;
+
+    glGenTextures(1, &cubemap);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+    for(int i=0; i<6; ++i) glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X+i, 0, GL_RGB16F, 1024, 1024, 0, GL_RGB, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glUseProgram(spheremap_skybox_prog);
+
+    constexpr std::pair<GLenum, float4x4> cubemap_faces[6]
+    {
+        {GL_TEXTURE_CUBE_MAP_POSITIVE_X, {{0,0,+1,0},{0,+1,0,0},{-1,0,0,0},{0,0,0,1}}},
+        {GL_TEXTURE_CUBE_MAP_NEGATIVE_X, {{0,0,-1,0},{0,+1,0,0},{+1,0,0,0},{0,0,0,1}}},
+        {GL_TEXTURE_CUBE_MAP_POSITIVE_Y, {{+1,0,0,0},{0,0,+1,0},{0,-1,0,0},{0,0,0,1}}},
+        {GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, {{+1,0,0,0},{0,0,-1,0},{0,+1,0,0},{0,0,0,1}}},
+        {GL_TEXTURE_CUBE_MAP_POSITIVE_Z, {{+1,0,0,0},{0,+1,0,0},{0,0,+1,0},{0,0,0,1}}},
+        {GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, {{-1,0,0,0},{0,+1,0,0},{0,0,-1,0},{0,0,0,1}}},
+    };
+    for(auto p : cubemap_faces)
+    {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, p.first, cubemap, 0);
+        glViewport(0, 0, 1024, 1024);
+        glUniformMatrix4fv(glGetUniformLocation(spheremap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &p.second[0][0]);
+        glBegin(GL_QUADS);
+        for(auto & v : skybox_verts) glVertex3fv(&v[0]);
+        glEnd();
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Initialize camera
     const float cam_speed = 8;
     camera cam {{0,0,-8}};
-
     double2 prev_cursor;
     glfwGetCursorPos(win, &prev_cursor.x, &prev_cursor.y);
     auto t0 = hr_clock::now();
@@ -237,6 +211,7 @@ int main() try
     {
         glfwPollEvents();
 
+        // Handle user input
         double2 cursor;
         glfwGetCursorPos(win, &cursor.x, &cursor.y);
         if(glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT))
@@ -257,12 +232,32 @@ int main() try
         if(glfwGetKey(win, GLFW_KEY_D)) move.x += 1;
         if(length(move) > 0) cam.move_local(normalize(move) * (cam_speed * timestep));
 
+        // Set up scene
         const float4x4 view_matrix = cam.get_view_matrix();
         const float4x4 proj_matrix = linalg::perspective_matrix(1.0f, (float)1280/720, 0.1f, 32.0f, linalg::pos_z, linalg::zero_to_one);
         const float4x4 view_proj_matrix = mul(proj_matrix, view_matrix);
+        auto skybox_cam = cam;
+        skybox_cam.position = {0,0,0};
+        const float4x4 skybox_view_proj_matrix = mul(proj_matrix, skybox_cam.get_view_matrix());
 
-        glClearColor(0.5f,0.5f,0.5f,1);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // Render skybox
+        glfwGetFramebufferSize(win, &width, &height);
+        glViewport(0, 0, width, height);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glUseProgram(cubemap_skybox_prog);
+        glUniformMatrix4fv(glGetUniformLocation(cubemap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &skybox_view_proj_matrix[0][0]);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+        glDepthMask(GL_FALSE);
+        glBegin(GL_QUADS);
+        for(auto & v : skybox_verts) glVertex3fv(&v[0]);
+        glEnd();
+
+        // Render spheres
+        glDepthMask(GL_TRUE);
+
+        for(int i : {0,1}) glEnableVertexAttribArray(i);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().position[0]);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().normal[0]);
 
         glUseProgram(prog);
         glUniformMatrix4fv(glGetUniformLocation(prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
@@ -281,14 +276,10 @@ int main() try
 
                 glUniform1f(glGetUniformLocation(prog, "u_metalness"), 1-(i+0.5f)/7);
                 glUniform1f(glGetUniformLocation(prog, "u_roughness"), (j+0.5f)/7);
-
-                glEnableVertexAttribArray(0);
-                glEnableVertexAttribArray(1);
-                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().position[0]);
-                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().normal[0]);
                 glDrawArrays(GL_QUADS, 0, sphere_verts.size());
             }
-        }       
+        }
+        for(int i : {0,1}) glDisableVertexAttribArray(i);
 
         glfwSwapBuffers(win);
     }

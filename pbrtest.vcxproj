@@ -20,6 +20,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="opengl.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="3rdparty\glew\glew.vcxproj">
@@ -28,6 +29,9 @@
     <ProjectReference Include="3rdparty\glfw\glfw.vcxproj">
       <Project>{7952ff0b-0e21-4315-80bb-c408014c1f09}</Project>
     </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="opengl.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>15.0</VCProjectVersion>
