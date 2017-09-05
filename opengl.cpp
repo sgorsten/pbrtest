@@ -107,6 +107,8 @@ vec3 compute_contribution(pbr_surface surf, vec3 light_vec, vec3 radiance)
 // This function computes the full lighting to apply to a single fragment
 uniform vec3 u_eye_position;
 uniform samplerCube u_irradiance_map;
+uniform samplerCube u_prefiltered_map;
+uniform sampler2D u_brdf_integration_map;
 
 vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
 {
@@ -125,11 +127,20 @@ vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, 
     surf.k = (roughness+1)*(roughness+1)/8;
 
     // Initialize ambient light amount
-    vec3 kS         = fresnelSchlickRoughness(surf.n_dot_v, surf.base_reflectivity, roughness); 
-    vec3 kD         = 1.0 - kS;
+
+    vec3 R = reflect(-surf.eye_vec, surf.normal_vec);   
+    const float MAX_REFLECTION_LOD = 4.0;
+    vec3 prefilteredColor = textureLod(u_prefiltered_map, R, roughness * MAX_REFLECTION_LOD).rgb;    
+
+    vec3 F          = fresnelSchlickRoughness(surf.n_dot_v, surf.base_reflectivity, roughness); 
+    vec2 envBRDF    = texture(u_brdf_integration_map, vec2(surf.n_dot_v, roughness)).rg;
+    vec3 specular   = prefilteredColor * (F * envBRDF.x + envBRDF.y);
+
+    vec3 kS         = F;
+    vec3 kD         = (1 - kS) * (1 - metalness);
     vec3 irradiance = texture(u_irradiance_map, surf.normal_vec).rgb;
     vec3 diffuse    = irradiance * albedo;
-    vec3 ambient    = kD * diffuse * ambient_occlusion; 
+    vec3 ambient    = (kD * diffuse + specular) * ambient_occlusion; 
     vec3 light      = ambient;
 
     // Add contributions from point lights
