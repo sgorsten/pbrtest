@@ -144,7 +144,7 @@ vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, 
     vec3 light      = ambient;
 
     // Add contributions from point lights
-    /*vec3 light_positions[4] = {vec3(-3, -3, -8), vec3(3, -3, -8), vec3(3, 3, -8), vec3(-3, 3, -8)};
+    vec3 light_positions[4] = {vec3(-3, -3, 8), vec3(3, -3, 8), vec3(3, 3, 8), vec3(-3, 3, 8)};
     vec3 light_colors[4] = {vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79)};
     for(int i=0; i<4; ++i)
     {
@@ -152,7 +152,7 @@ vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, 
         float distance = length(light_positions[i] - position);
         vec3 radiance  = light_colors[i] / (distance * distance); 
         light += compute_contribution(surf, L, radiance);
-    }*/
+    }
     return light;
 }
 )";
