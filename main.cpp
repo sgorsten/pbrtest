@@ -27,79 +27,79 @@ void main()
 })";
 
 constexpr char frag_shader_source[] = R"(#version 420
-uniform vec3  u_eye_position;
+const float PI = 3.14159265359;
+
+vec3 compute_contribution(vec3 albedo, float roughness, float metalness, vec3 F0, vec3 N, vec3 V, float NdotV, vec3 L, vec3 radiance)
+{
+    // Compute half vector and precompute some dot products
+    vec3 H = normalize(V + L);
+    float NdotL = max(dot(N, L), 0);
+    float NdotH = max(dot(N, H), 0);    
+
+    // Evaluate Trowbridge-Reitz GGX normal distribution function
+    float alpha = roughness*roughness;
+    float denom = NdotH*NdotH*(alpha*alpha-1) + 1;
+    denom = PI * denom * denom;
+    float D = (alpha*alpha) / denom;
+
+    // Evaluate Smith's Schlick-GGX geometry function
+    float k_direct = (roughness+1)*(roughness+1)/8;
+    float ggx1 = NdotL / (NdotL*(1-k_direct) + k_direct);
+    float ggx2 = NdotV / (NdotV*(1-k_direct) + k_direct);
+    float G = ggx1 * ggx2;
+
+    // Evaluate Fresnel-Schlick approximation to Fresnel equation
+    vec3 F = F0 + (1-F0) * pow(1-max(dot(H, V), 0), 5);
+
+    // Evaluate Cook-Torrance specular BRDF
+    vec3 specular = (D * G * F) / (4 * NdotV * NdotL + 0.001);  
+
+    // Compute diffuse contribution
+    vec3 diffuse = (1-F) * (1-metalness) * albedo/PI;
+
+    // Return total contribution from this light
+    return (diffuse + specular) * radiance * NdotL;
+}
+
+uniform vec3 u_eye_position;
+vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, float metalness, float ambient_occlusion)
+{
+    // Determine common lighting equation terms
+    vec3 N = normalize(normal); 
+    vec3 V = normalize(u_eye_position - position);
+    float NdotV = max(dot(N, V), 0);
+    vec3 F0 = mix(vec3(0.04), albedo, metalness);
+
+    // Initialize ambient light amount
+    vec3 light = vec3(0.03) * albedo * ambient_occlusion;
+
+    // Add contributions from point lights
+    vec3 light_positions[4] = {vec3(-2, -2, -8), vec3(2, -2, -8), vec3(2, 2, -8), vec3(-2, 2, -8)};
+    vec3 light_colors[4] = {vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79)};
+    for(int i=0; i<4; ++i)
+    {
+        vec3 L = normalize(light_positions[i] - position);
+        float distance = length(light_positions[i] - position);
+        vec3 radiance  = light_colors[i] / (distance * distance); 
+        light += compute_contribution(albedo, roughness, metalness, F0, N, V, NdotV, L, radiance);
+    }
+    return light;
+}
+
 uniform vec3  u_albedo;
-uniform float u_metalness;
 uniform float u_roughness;
+uniform float u_metalness;
 uniform float u_ambient_occlusion;
 layout(location=0) in vec3 position;
 layout(location=1) in vec3 normal;
 
-const float PI = 3.14159265359;
-
-vec3 fresnelSchlick(float cosTheta, vec3 F0)
-{
-    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
-}
-
-float DistributionGGX(vec3 N, vec3 H, float roughness)
-{
-    float a      = roughness*roughness;
-    float a2     = a*a;
-    float NdotH  = max(dot(N, H), 0.0);
-    float NdotH2 = NdotH*NdotH;
-	
-    float nom   = a2;
-    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
-    denom = PI * denom * denom;
-	
-    return nom / denom;
-}
-
 void main() 
 { 
-    vec3 N = normalize(normal); 
-    vec3 V = normalize(u_eye_position - position);
-
-    vec3 F0 = mix(vec3(0.04), u_albedo, u_metalness);
-
-    vec3 light_positions[4] = {vec3(-2, -2, -8), vec3(2, -2, -8), vec3(2, 2, -8), vec3(-2, 2, -8)};
-    vec3 light_colors[4] = {vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79)};
-
-    vec3 Lo = vec3(0.03) * u_albedo * u_ambient_occlusion;
-    for(int i=0; i<4; ++i)
-    {
-        vec3 L = normalize(light_positions[i] - position);
-        vec3 H = normalize(V + L);
-
-        float NdotV = max(dot(N, V), 0);
-        float NdotL = max(dot(N, L), 0);
-    
-        float distance = length(light_positions[i] - position);
-        vec3 radiance  = light_colors[i] / (distance * distance); 
-
-        vec3 F = fresnelSchlick(max(dot(H, V), 0), F0);
-
-        float NDF = DistributionGGX(N, H, u_roughness);
-
-        // Evaluate Smith's Schlick-GGX geometry term
-        float r = u_roughness + 1, k = r*r/8;
-        float ggx1 = NdotL / (NdotL*(1-k) + k);
-        float ggx2 = NdotV / (NdotV*(1-k) + k);
-        float G = ggx1 * ggx2;
-
-        vec3 nominator    = NDF * G * F;
-        float denominator = 4 * max(dot(N, V), 0) * NdotL + 0.001; 
-        vec3 specular     = nominator / denominator;  
-
-        vec3 kS = F;
-        vec3 kD = (1-kS)*(1-u_metalness);
-
-        Lo += (kD * u_albedo / PI + specular) * radiance * NdotL;
-    }
+    // Compute our PBR lighting
+    vec3 light = compute_lighting(position, normal, u_albedo, u_roughness, u_metalness, u_ambient_occlusion);
 
     // Apply simple tone mapping and write to fragment
-    gl_FragColor = vec4(Lo / (Lo + 1), 1);
+    gl_FragColor = vec4(light / (light + 1), 1);
 })";
 
 struct camera
@@ -189,6 +189,7 @@ int main() try
 
     glfwInit();
 
+    glfwWindowHint(GLFW_SAMPLES, 4);
     glfwWindowHint(GLFW_SRGB_CAPABLE, GLFW_TRUE);
     auto win = glfwCreateWindow(1280, 720, "PBR Test", nullptr, nullptr);
     glfwMakeContextCurrent(win);
@@ -207,6 +208,7 @@ int main() try
     glFrontFace(GL_CW); // Still actually counter-clockwise
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_FRAMEBUFFER_SRGB);
+    glEnable(GL_MULTISAMPLE);
 
     const float cam_speed = 8;
     camera cam {{0,0,-8}};
