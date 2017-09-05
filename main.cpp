@@ -29,46 +29,62 @@ void main()
 constexpr char frag_shader_source[] = R"(#version 420
 const float PI = 3.14159265359;
 
-vec3 compute_contribution(vec3 albedo, float roughness, float metalness, vec3 F0, vec3 N, vec3 V, float NdotV, vec3 L, vec3 radiance)
+// This structure contains the essential information about a fragment to compute lighting for it
+struct pbr_surface
+{
+    vec3 normal_vec;        // unit vector perpendicular to the surface
+    vec3 eye_vec;           // unit vector pointing from the surface to the viewer
+    float n_dot_v;          // max(dot(normal_vec, eye_vec), 0)
+    vec3 diffuse_albedo;    // (1-metalness) * albedo/PI
+    vec3 base_reflectivity; // F0
+    float alpha;            // roughness^2
+    float k;                // computed different for direct and indirect lighting
+};
+
+// This function computes the contribution of a single light to a fragment
+vec3 compute_contribution(pbr_surface surf, vec3 light_vec, vec3 radiance)
 {
     // Compute half vector and precompute some dot products
-    vec3 H = normalize(V + L);
-    float NdotL = max(dot(N, L), 0);
-    float NdotH = max(dot(N, H), 0);    
+    vec3 half_vec = normalize(surf.eye_vec + light_vec);
+    float n_dot_l = max(dot(surf.normal_vec, light_vec), 0);
+    float n_dot_h = max(dot(surf.normal_vec, half_vec), 0);    
+    float v_dot_h = max(dot(surf.eye_vec, half_vec), 0);
 
     // Evaluate Trowbridge-Reitz GGX normal distribution function
-    float alpha = roughness*roughness;
-    float denom = NdotH*NdotH*(alpha*alpha-1) + 1;
+    float denom = n_dot_h*n_dot_h*(surf.alpha*surf.alpha-1) + 1;
     denom = PI * denom * denom;
-    float D = (alpha*alpha) / denom;
+    float D = (surf.alpha*surf.alpha) / denom;
 
     // Evaluate Smith's Schlick-GGX geometry function
-    float k_direct = (roughness+1)*(roughness+1)/8;
-    float ggx1 = NdotL / (NdotL*(1-k_direct) + k_direct);
-    float ggx2 = NdotV / (NdotV*(1-k_direct) + k_direct);
+    float ggx1 = n_dot_l / (n_dot_l*(1-surf.k) + surf.k);
+    float ggx2 = surf.n_dot_v / (surf.n_dot_v*(1-surf.k) + surf.k);
     float G = ggx1 * ggx2;
 
     // Evaluate Fresnel-Schlick approximation to Fresnel equation
-    vec3 F = F0 + (1-F0) * pow(1-max(dot(H, V), 0), 5);
+    vec3 F = surf.base_reflectivity + (1-surf.base_reflectivity) * pow(1-v_dot_h, 5);
 
     // Evaluate Cook-Torrance specular BRDF
-    vec3 specular = (D * G * F) / (4 * NdotV * NdotL + 0.001);  
+    vec3 specular = (D * G * F) / (4 * surf.n_dot_v * n_dot_l + 0.001);  
 
     // Compute diffuse contribution
-    vec3 diffuse = (1-F) * (1-metalness) * albedo/PI;
+    vec3 diffuse = (1-F) * surf.diffuse_albedo;
 
     // Return total contribution from this light
-    return (diffuse + specular) * radiance * NdotL;
+    return (diffuse + specular) * radiance * n_dot_l;
 }
 
+// This function computes the full lighting to apply to a single fragment
 uniform vec3 u_eye_position;
 vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, float metalness, float ambient_occlusion)
 {
-    // Determine common lighting equation terms
-    vec3 N = normalize(normal); 
-    vec3 V = normalize(u_eye_position - position);
-    float NdotV = max(dot(N, V), 0);
-    vec3 F0 = mix(vec3(0.04), albedo, metalness);
+    pbr_surface surf;
+    surf.normal_vec = normalize(normal);
+    surf.eye_vec = normalize(u_eye_position - position);
+    surf.n_dot_v = max(dot(surf.normal_vec, surf.eye_vec), 0);
+    surf.base_reflectivity = mix(vec3(0.04), albedo, metalness);
+    surf.diffuse_albedo = (1-metalness) * albedo/PI;
+    surf.alpha = roughness*roughness;
+    surf.k = (roughness+1)*(roughness+1)/8;
 
     // Initialize ambient light amount
     vec3 light = vec3(0.03) * albedo * ambient_occlusion;
@@ -81,25 +97,26 @@ vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, 
         vec3 L = normalize(light_positions[i] - position);
         float distance = length(light_positions[i] - position);
         vec3 radiance  = light_colors[i] / (distance * distance); 
-        light += compute_contribution(albedo, roughness, metalness, F0, N, V, NdotV, L, radiance);
+        light += compute_contribution(surf, L, radiance);
     }
     return light;
 }
 
-uniform vec3  u_albedo;
+// Fragment shader for untextured PBR surface
+uniform vec3 u_albedo;
 uniform float u_roughness;
 uniform float u_metalness;
 uniform float u_ambient_occlusion;
 layout(location=0) in vec3 position;
 layout(location=1) in vec3 normal;
-
+layout(location=0) out vec4 f_color;
 void main() 
 { 
     // Compute our PBR lighting
     vec3 light = compute_lighting(position, normal, u_albedo, u_roughness, u_metalness, u_ambient_occlusion);
 
     // Apply simple tone mapping and write to fragment
-    gl_FragColor = vec4(light / (light + 1), 1);
+    f_color = vec4(light / (light + 1), 1);
 })";
 
 struct camera
