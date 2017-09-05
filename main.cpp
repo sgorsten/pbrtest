@@ -41,6 +41,37 @@ void main()
     f_color = texture(u_texture, direction);
 })";
 
+constexpr char cubemap_convolution_frag_shader_source[] = R"(
+layout(location=0) uniform samplerCube u_texture;
+layout(location=0) in vec3 direction;
+layout(location=0) out vec4 f_color;
+void main()
+{
+    vec3 normal = normalize(direction);
+    vec3 up = vec3(0,1,0);
+    vec3 right = cross(up, normal);
+    up = cross(normal, right);
+
+    float sampleDelta = 0.01, nrSamples = 0; 
+    vec3 irradiance = vec3(0);
+    for(float phi = 0.0; phi < 2.0 * PI; phi += sampleDelta)
+    {
+        for(float theta = 0.0; theta < 0.5 * PI; theta += sampleDelta)
+        {
+            // spherical to cartesian (in tangent space)
+            vec3 tangentSample = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+            // tangent space to world
+            vec3 sampleVec = tangentSample.x * right + tangentSample.y * up + tangentSample.z * normal; 
+
+            irradiance += texture(u_texture, sampleVec).rgb * cos(theta) * sin(theta);
+            nrSamples++;
+        }
+    }
+
+    f_color = vec4(PI * irradiance / nrSamples, 1);
+
+})";
+
 constexpr char vert_shader_source[] = R"(
 uniform mat4 u_view_proj_matrix;
 uniform mat4 u_model_matrix;
@@ -111,6 +142,32 @@ std::vector<vertex> make_sphere(int slices, int stacks, float radius)
 #define STB_IMAGE_IMPLEMENTATION
 #include "3rdparty/stb_image.h"
 
+template<class F> GLuint render_cubemap(GLenum internal_format, GLsizei width, F draw_face)
+{
+    GLuint cubemap;
+    glCreateTextures(GL_TEXTURE_CUBE_MAP, 1, &cubemap);
+    glTextureStorage2D(cubemap, 1, internal_format, width, width);
+    glTextureParameteri(cubemap, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(cubemap, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(cubemap, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(cubemap, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureParameteri(cubemap, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    GLuint fbo;
+    glCreateFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    glViewport(0, 0, width, width);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X, cubemap, 0); draw_face(float4x4{{0,0,+1,0},{0,+1,0,0},{-1,0,0,0},{0,0,0,1}});
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_X, cubemap, 0); draw_face(float4x4{{0,0,-1,0},{0,+1,0,0},{+1,0,0,0},{0,0,0,1}});
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_Y, cubemap, 0); draw_face(float4x4{{+1,0,0,0},{0,0,+1,0},{0,-1,0,0},{0,0,0,1}});
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, cubemap, 0); draw_face(float4x4{{+1,0,0,0},{0,0,-1,0},{0,+1,0,0},{0,0,0,1}});
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_Z, cubemap, 0); draw_face(float4x4{{+1,0,0,0},{0,+1,0,0},{0,0,+1,0},{0,0,0,1}});
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, cubemap, 0); draw_face(float4x4{{-1,0,0,0},{0,+1,0,0},{0,0,-1,0},{0,0,0,1}});
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    return cubemap; 
+}
+
 int main() try
 {
     auto sphere_verts = make_sphere(32,16,0.4f);
@@ -143,6 +200,8 @@ int main() try
     auto spheremap_skybox_prog = link_program({skybox_vert_shader, spheremap_skybox_frag_shader});
     auto cubemap_skybox_frag_shader = compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_skybox_frag_shader_source});
     auto cubemap_skybox_prog = link_program({skybox_vert_shader, cubemap_skybox_frag_shader});
+    auto cubemap_convolution_frag_shader = compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_convolution_frag_shader_source});
+    auto cubemap_convolution_prog = link_program({skybox_vert_shader, cubemap_convolution_frag_shader});
 
     // Set up a right-handed, x-right, y-down, z-forward coordinate system with a 0-to-1 depth buffer
     glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
@@ -152,6 +211,7 @@ int main() try
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_FRAMEBUFFER_SRGB);
     glEnable(GL_MULTISAMPLE);
+    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
 
     int width, height;
     float * pixels = stbi_loadf("monument-valley.hdr", &width, &height, nullptr, 3);
@@ -166,40 +226,24 @@ int main() try
     stbi_image_free(pixels);
 
     // Convert spheremap to cubemap
-    GLuint fbo, cubemap;
-
-    glGenTextures(1, &cubemap);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
-    for(int i=0; i<6; ++i) glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X+i, 0, GL_RGB16F, 1024, 1024, 0, GL_RGB, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    glGenFramebuffers(1, &fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glUseProgram(spheremap_skybox_prog);
-
-    constexpr std::pair<GLenum, float4x4> cubemap_faces[6]
+    GLuint cubemap = render_cubemap(GL_RGBA16F, 1024, [&](const float4x4 & view_proj_matrix)
     {
-        {GL_TEXTURE_CUBE_MAP_POSITIVE_X, {{0,0,+1,0},{0,+1,0,0},{-1,0,0,0},{0,0,0,1}}},
-        {GL_TEXTURE_CUBE_MAP_NEGATIVE_X, {{0,0,-1,0},{0,+1,0,0},{+1,0,0,0},{0,0,0,1}}},
-        {GL_TEXTURE_CUBE_MAP_POSITIVE_Y, {{+1,0,0,0},{0,0,+1,0},{0,-1,0,0},{0,0,0,1}}},
-        {GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, {{+1,0,0,0},{0,0,-1,0},{0,+1,0,0},{0,0,0,1}}},
-        {GL_TEXTURE_CUBE_MAP_POSITIVE_Z, {{+1,0,0,0},{0,+1,0,0},{0,0,+1,0},{0,0,0,1}}},
-        {GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, {{-1,0,0,0},{0,+1,0,0},{0,0,-1,0},{0,0,0,1}}},
-    };
-    for(auto p : cubemap_faces)
-    {
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, p.first, cubemap, 0);
-        glViewport(0, 0, 1024, 1024);
-        glUniformMatrix4fv(glGetUniformLocation(spheremap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &p.second[0][0]);
+        glUseProgram(spheremap_skybox_prog);
+        glUniformMatrix4fv(glGetUniformLocation(spheremap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
         glBegin(GL_QUADS);
         for(auto & v : skybox_verts) glVertex3fv(&v[0]);
         glEnd();
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    });
+
+    GLuint conv_cubemap = render_cubemap(GL_RGBA16F, 32, [&](const float4x4 & view_proj_matrix)
+    {
+        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+        glUseProgram(cubemap_convolution_prog);
+        glUniformMatrix4fv(glGetUniformLocation(cubemap_convolution_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+        glBegin(GL_QUADS);
+        for(auto & v : skybox_verts) glVertex3fv(&v[0]);
+        glEnd();
+    });
 
     // Initialize camera
     const float cam_speed = 8;
@@ -246,7 +290,7 @@ int main() try
         glClear(GL_DEPTH_BUFFER_BIT);
         glUseProgram(cubemap_skybox_prog);
         glUniformMatrix4fv(glGetUniformLocation(cubemap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &skybox_view_proj_matrix[0][0]);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, glfwGetKey(win, GLFW_KEY_C) ? conv_cubemap : cubemap);
         glDepthMask(GL_FALSE);
         glBegin(GL_QUADS);
         for(auto & v : skybox_verts) glVertex3fv(&v[0]);
@@ -259,11 +303,12 @@ int main() try
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().position[0]);
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().normal[0]);
 
+        glBindTexture(GL_TEXTURE_CUBE_MAP, conv_cubemap);
         glUseProgram(prog);
         glUniformMatrix4fv(glGetUniformLocation(prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
         glUniform3fv(glGetUniformLocation(prog, "u_eye_position"), 1, &cam.position[0]);
 
-        const float3 albedo {1,0,0};
+        const float3 albedo {1,1,1}; //0,0};
         glUniform3fv(glGetUniformLocation(prog, "u_albedo"), 1, &albedo[0]);
         glUniform1f(glGetUniformLocation(prog, "u_ambient_occlusion"), 1.0f);
         for(int i=0; i<7; ++i)

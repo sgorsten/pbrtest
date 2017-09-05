@@ -56,10 +56,9 @@ GLuint link_program(std::initializer_list<GLuint> shader_stages)
 }
 
 
-std::string_view preamble = "#version 450\n";
+std::string_view preamble = "#version 450\nconst float PI = 3.14159265359;\n";
 
 std::string_view pbr_lighting = R"(
-const float PI = 3.14159265359;
 
 // This structure contains the essential information about a fragment to compute lighting for it
 struct pbr_surface
@@ -107,6 +106,13 @@ vec3 compute_contribution(pbr_surface surf, vec3 light_vec, vec3 radiance)
 
 // This function computes the full lighting to apply to a single fragment
 uniform vec3 u_eye_position;
+uniform samplerCube u_irradiance_map;
+
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
+{
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(1.0 - cosTheta, 5.0);
+} 
+
 vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, float metalness, float ambient_occlusion)
 {
     pbr_surface surf;
@@ -119,10 +125,15 @@ vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, 
     surf.k = (roughness+1)*(roughness+1)/8;
 
     // Initialize ambient light amount
-    vec3 light = vec3(0.03) * albedo * ambient_occlusion;
+    vec3 kS         = fresnelSchlickRoughness(surf.n_dot_v, surf.base_reflectivity, roughness); 
+    vec3 kD         = 1.0 - kS;
+    vec3 irradiance = texture(u_irradiance_map, surf.normal_vec).rgb;
+    vec3 diffuse    = irradiance * albedo;
+    vec3 ambient    = kD * diffuse * ambient_occlusion; 
+    vec3 light      = ambient;
 
     // Add contributions from point lights
-    vec3 light_positions[4] = {vec3(-2, -2, -8), vec3(2, -2, -8), vec3(2, 2, -8), vec3(-2, 2, -8)};
+    /*vec3 light_positions[4] = {vec3(-3, -3, -8), vec3(3, -3, -8), vec3(3, 3, -8), vec3(-3, 3, -8)};
     vec3 light_colors[4] = {vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79)};
     for(int i=0; i<4; ++i)
     {
@@ -130,7 +141,7 @@ vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, 
         float distance = length(light_positions[i] - position);
         vec3 radiance  = light_colors[i] / (distance * distance); 
         light += compute_contribution(surf, L, radiance);
-    }
+    }*/
     return light;
 }
 )";
