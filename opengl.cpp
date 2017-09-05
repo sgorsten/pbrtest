@@ -156,3 +156,350 @@ vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, 
     return light;
 }
 )";
+
+
+constexpr char skybox_vert_shader_source[] = R"(
+uniform mat4 u_view_proj_matrix;
+layout(location=0) in vec3 v_direction;
+layout(location=0) out vec3 direction;
+void main()
+{
+    direction   = v_direction;
+    gl_Position = u_view_proj_matrix * vec4(direction,1);
+})";
+
+constexpr char spheremap_skybox_frag_shader_source[] = R"(
+uniform sampler2D u_texture;
+layout(location=0) in vec3 direction;
+layout(location=0) out vec4 f_color;
+vec2 compute_spherical_texcoords(vec3 direction)
+{
+    return vec2(atan(direction.x, direction.z)*0.1591549, asin(direction.y)*0.3183099 + 0.5);
+}
+void main()
+{
+    f_color = texture(u_texture, compute_spherical_texcoords(normalize(direction)));
+})";
+
+constexpr char cubemap_skybox_frag_shader_source[] = R"(
+uniform samplerCube u_texture;
+layout(location=0) in vec3 direction;
+layout(location=0) out vec4 f_color;
+void main()
+{
+    f_color = textureLod(u_texture, direction, 1.2);
+})";
+
+constexpr char cubemap_convolution_frag_shader_source[] = R"(
+uniform samplerCube u_texture;
+layout(location=0) in vec3 direction;
+layout(location=0) out vec4 f_color;
+void main()
+{
+    vec3 normal = normalize(direction);
+    vec3 up = vec3(0,1,0);
+    vec3 right = cross(up, normal);
+    up = cross(normal, right);
+
+    float sampleDelta = 0.01, nrSamples = 0; 
+    vec3 irradiance = vec3(0);
+    for(float phi = 0.0; phi < 2.0 * PI; phi += sampleDelta)
+    {
+        for(float theta = 0.0; theta < 0.5 * PI; theta += sampleDelta)
+        {
+            // spherical to cartesian (in tangent space)
+            vec3 tangentSample = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+            // tangent space to world
+            vec3 sampleVec = tangentSample.x * right + tangentSample.y * up + tangentSample.z * normal; 
+
+            irradiance += texture(u_texture, sampleVec).rgb * cos(theta) * sin(theta);
+            nrSamples++;
+        }
+    }
+
+    f_color = vec4(PI * irradiance / nrSamples, 1);
+
+})";
+
+constexpr char importance_sample_ggx[] = R"(
+vec2 hammersley_sequence(uint i, uint N)
+{
+    // Evaluate Van Der Corpus sequence
+    uint bits = i;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    float radical_inverse = float(bits) * 2.3283064365386963e-10; // / 0x100000000
+
+    return vec2(float(i)/float(N), radical_inverse);
+}  
+  
+vec3 importance_sample_ggx(vec2 Xi, vec3 N, float roughness)
+{
+    float a = roughness*roughness;
+	
+    float phi = 2.0 * PI * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a*a - 1.0) * Xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta*cosTheta);
+	
+    // from spherical coordinates to cartesian coordinates
+    vec3 H;
+    H.x = cos(phi) * sinTheta;
+    H.y = sin(phi) * sinTheta;
+    H.z = cosTheta;
+	
+    // from tangent-space vector to world-space sample vector
+    vec3 up        = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent   = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+	
+    vec3 sampleVec = tangent * H.x + bitangent * H.y + N * H.z;
+    return normalize(sampleVec);
+}
+)";
+
+constexpr char prefilter_frag_shader_source[] = R"(
+uniform samplerCube u_texture;
+uniform float u_roughness;
+layout(location=0) in vec3 direction;
+layout(location=0) out vec4 f_color;
+
+void main()
+{		
+    vec3 N = normalize(direction);    
+    vec3 R = N;
+    vec3 V = R;
+
+    const uint SAMPLE_COUNT = 1024u;   
+    vec3 sum_color = vec3(0,0,0);
+    float sum_weight = 0;     
+    for(uint i = 0u; i < SAMPLE_COUNT; ++i)
+    {
+        vec2 Xi = hammersley_sequence(i, SAMPLE_COUNT);
+        vec3 H  = importance_sample_ggx(Xi, N, u_roughness);
+        vec3 L  = normalize(2.0 * dot(V, H) * H - V);
+
+        float n_dot_l = dot(N, L);
+        if(n_dot_l > 0)
+        {
+            sum_color += texture(u_texture, L).rgb * n_dot_l;
+            sum_weight += n_dot_l;
+        }
+    }
+
+    f_color = vec4(sum_color/sum_weight, 1);
+})";
+
+constexpr char brdf_integration_vert_shader_source[] = R"(
+layout(location=0) in vec2 v_position;
+layout(location=1) in vec2 v_texcoords;
+layout(location=0) out vec2 texcoords;
+void main()
+{
+    texcoords = v_texcoords;
+    gl_Position = vec4(v_position,0,1);
+})";
+
+constexpr char brdf_integration_frag_shader_source[] = R"(
+layout(location=0) in vec2 texcoords;
+layout(location=0) out vec4 f_color;
+
+float GeometrySchlickGGX(float NdotV, float roughness)
+{
+    float a = roughness;
+    float k = (a * a) / 2.0;
+
+    float nom   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return nom / denom;
+}
+// ----------------------------------------------------------------------------
+float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
+{
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx2 = GeometrySchlickGGX(NdotV, roughness);
+    float ggx1 = GeometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}
+
+vec2 IntegrateBRDF(float NdotV, float roughness)
+{
+    vec3 V;
+    V.x = sqrt(1.0 - NdotV*NdotV);
+    V.y = 0.0;
+    V.z = NdotV;
+
+    float A = 0.0;
+    float B = 0.0;
+
+    vec3 N = vec3(0.0, 0.0, 1.0);
+
+    const uint SAMPLE_COUNT = 1024u;
+    for(uint i = 0u; i < SAMPLE_COUNT; ++i)
+    {
+        vec2 Xi = hammersley_sequence(i, SAMPLE_COUNT);
+        vec3 H  = importance_sample_ggx(Xi, N, roughness);
+        vec3 L  = normalize(2.0 * dot(V, H) * H - V);
+
+        float NdotL = max(L.z, 0.0);
+        float NdotH = max(H.z, 0.0);
+        float VdotH = max(dot(V, H), 0.0);
+
+        if(NdotL > 0.0)
+        {
+            float G = GeometrySmith(N, V, L, roughness);
+            float G_Vis = (G * VdotH) / (NdotH * NdotV);
+            float Fc = pow(1.0 - VdotH, 5.0);
+
+            A += (1.0 - Fc) * G_Vis;
+            B += Fc * G_Vis;
+        }
+    }
+    A /= float(SAMPLE_COUNT);
+    B /= float(SAMPLE_COUNT);
+    return vec2(A, B);
+}
+void main() 
+{
+    f_color = vec4(IntegrateBRDF(texcoords.x, texcoords.y), 0, 1);
+})";
+
+pbr_tools::pbr_tools()
+{
+    GLuint skybox_vert_shader  = compile_shader(GL_VERTEX_SHADER, {preamble, skybox_vert_shader_source});
+    spheremap_skybox_prog      = link_program({skybox_vert_shader, compile_shader(GL_FRAGMENT_SHADER, {preamble, spheremap_skybox_frag_shader_source})});
+    cubemap_skybox_prog        = link_program({skybox_vert_shader, compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_skybox_frag_shader_source})});
+    cubemap_convolution_prog   = link_program({skybox_vert_shader, compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_convolution_frag_shader_source})});
+    prefilter_prog             = link_program({skybox_vert_shader, compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, prefilter_frag_shader_source})});
+    brdf_integration_prog      = link_program({compile_shader(GL_VERTEX_SHADER, {preamble, brdf_integration_vert_shader_source}), 
+                                               compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, brdf_integration_frag_shader_source})});
+}
+
+template<class F> GLuint render_cubemap(GLsizei levels, GLenum internal_format, GLsizei width, F draw_face)
+{
+    GLuint cubemap;
+    glCreateTextures(GL_TEXTURE_CUBE_MAP, 1, &cubemap);
+    glTextureStorage2D(cubemap, levels, internal_format, width, width);
+    glTextureParameteri(cubemap, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(cubemap, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(cubemap, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(cubemap, GL_TEXTURE_MIN_FILTER, levels > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+    glTextureParameteri(cubemap, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    GLuint fbo;
+    glCreateFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    for(GLint mip=0; mip<levels; ++mip)
+    {
+        glViewport(0, 0, width, width);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X, cubemap, mip); draw_face(float4x4{{0,0,+1,0},{0,+1,0,0},{-1,0,0,0},{0,0,0,1}}, mip);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_X, cubemap, mip); draw_face(float4x4{{0,0,-1,0},{0,+1,0,0},{+1,0,0,0},{0,0,0,1}}, mip);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_Y, cubemap, mip); draw_face(float4x4{{+1,0,0,0},{0,0,+1,0},{0,-1,0,0},{0,0,0,1}}, mip);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_Y, cubemap, mip); draw_face(float4x4{{+1,0,0,0},{0,0,-1,0},{0,+1,0,0},{0,0,0,1}}, mip);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_Z, cubemap, mip); draw_face(float4x4{{+1,0,0,0},{0,+1,0,0},{0,0,+1,0},{0,0,0,1}}, mip);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_NEGATIVE_Z, cubemap, mip); draw_face(float4x4{{-1,0,0,0},{0,+1,0,0},{0,0,-1,0},{0,0,0,1}}, mip);
+        width = std::max(width/2, 1);
+    }
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    return cubemap; 
+}
+
+constexpr float3 skybox_verts[]
+{
+    {-1,-1,-1}, {-1,+1,-1}, {-1,+1,+1}, {-1,-1,+1},
+    {+1,-1,-1}, {+1,-1,+1}, {+1,+1,+1}, {+1,+1,-1},
+    {-1,-1,-1}, {-1,-1,+1}, {+1,-1,+1}, {+1,-1,-1},
+    {-1,+1,-1}, {+1,+1,-1}, {+1,+1,+1}, {-1,+1,+1},
+    {-1,-1,-1}, {+1,-1,-1}, {+1,+1,-1}, {-1,+1,-1},
+    {-1,-1,+1}, {-1,+1,+1}, {+1,+1,+1}, {+1,-1,+1}
+};
+
+GLuint pbr_tools::convert_spheremap_to_cubemap(GLenum internal_format, GLsizei width, GLuint spheremap) const
+{
+    glUseProgram(spheremap_skybox_prog);
+    glBindTexture(GL_TEXTURE_2D, spheremap);
+    return render_cubemap(1, internal_format, width, [&](const float4x4 & view_proj_matrix, int mip)
+    {        
+        glUniformMatrix4fv(glGetUniformLocation(spheremap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+        glBegin(GL_QUADS);
+        for(auto & v : skybox_verts) glVertex3fv(&v[0]);
+        glEnd();
+    });
+}
+
+GLuint pbr_tools::compute_irradiance_map(GLuint cubemap) const
+{
+    return render_cubemap(1, GL_RGB16F, 32, [&](const float4x4 & view_proj_matrix, int mip)
+    {
+        glUseProgram(cubemap_convolution_prog);
+        glUniformMatrix4fv(glGetUniformLocation(cubemap_convolution_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+        glBegin(GL_QUADS);
+        for(auto & v : skybox_verts) glVertex3fv(&v[0]);
+        glEnd();
+    });
+}
+
+GLuint pbr_tools::compute_reflectance_map(GLuint cubemap) const
+{
+    return render_cubemap(5, GL_RGB16F, 128, [&](const float4x4 & view_proj_matrix, int mip)
+    {
+        glUseProgram(prefilter_prog);
+        glUniformMatrix4fv(glGetUniformLocation(prefilter_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+        glUniform1f(glGetUniformLocation(prefilter_prog, "u_roughness"), mip/4.0f);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+        glBegin(GL_QUADS);
+        for(auto & v : skybox_verts) glVertex3fv(&v[0]);
+        glEnd();
+    });
+}
+
+GLuint pbr_tools::compute_brdf_integration_map() const
+{
+    GLuint brdf_integration_map;
+    glCreateTextures(GL_TEXTURE_2D, 1, &brdf_integration_map);
+    glTextureStorage2D(brdf_integration_map, 1, GL_RG16F, 512, 512);
+    glTextureParameteri(brdf_integration_map, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(brdf_integration_map, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(brdf_integration_map, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTextureParameteri(brdf_integration_map, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    GLuint fbo;
+    glCreateFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, brdf_integration_map, 0);
+    glViewport(0,0,512,512);
+
+    glUseProgram(brdf_integration_prog);
+    glBegin(GL_QUADS);
+    glVertexAttrib2f(1, 0, 0); glVertex2f(-1, -1);
+    glVertexAttrib2f(1, 0, 1); glVertex2f(-1, +1);
+    glVertexAttrib2f(1, 1, 1); glVertex2f(+1, +1);
+    glVertexAttrib2f(1, 1, 0); glVertex2f(+1, -1);
+    glEnd();
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+
+    return brdf_integration_map;
+}
+
+void pbr_tools::draw_skybox(GLuint cubemap, const float4x4 & view_proj_matrix) const
+{
+    glUseProgram(cubemap_skybox_prog);
+    glUniformMatrix4fv(glGetUniformLocation(cubemap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+    glUniform1i(glGetUniformLocation(cubemap_skybox_prog, "u_texture"), 0);
+    glBindTextureUnit(0, cubemap);
+    glDepthMask(GL_FALSE);
+    glBegin(GL_QUADS);
+    for(auto & v : skybox_verts) glVertex3fv(&v[0]);
+    glEnd();
+    glDepthMask(GL_TRUE);
+}
+
