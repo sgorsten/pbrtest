@@ -150,10 +150,11 @@ int main() try
 
     // Convert spheremap to cubemap
     const GLuint brdf_integration_map = tools.compute_brdf_integration_map();
-    const environment env[2]
+    const environment env[3]
     {
         load_enviroment(tools, "monument-valley.hdr"),
-        load_enviroment(tools, "factory-catwalk.hdr")
+        load_enviroment(tools, "factory-catwalk.hdr"),
+        load_enviroment(tools, "shiodome-stairs.hdr"),
     };
     int env_index = 0;
 
@@ -194,6 +195,7 @@ int main() try
 
         if(glfwGetKey(win, GLFW_KEY_1)) env_index=0;
         if(glfwGetKey(win, GLFW_KEY_2)) env_index=1;
+        if(glfwGetKey(win, GLFW_KEY_3)) env_index=2;
 
         // Set up scene
         const float4x4 view_matrix = cam.get_view_matrix();

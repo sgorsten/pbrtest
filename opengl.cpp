@@ -225,23 +225,35 @@ uniform float u_roughness;
 layout(location=0) in vec3 direction;
 layout(location=0) out vec4 f_color;
 
+const int sample_count = 1024;
 void main()
 {
     // As we are evaluating base reflectance, both the normal and view vectors are equal to our sampling direction
     const vec3 N = normalize(direction), V = N;
     const mat3 basis = tangent_basis(N);
+    const float alpha = roughness_to_alpha(u_roughness);
+
+    // Precompute the average solid angle of a cube map texel
+    const int cube_width = textureSize(u_texture, 0).x;
+    const float texel_solid_angle = pi*4 / (6*cube_width*cube_width);
 
     vec3 sum_color = vec3(0,0,0);
     float sum_weight = 0;     
-    for(int i=0; i<1024; ++i)
+    for(int i=0; i<sample_count; ++i)
     {
         // For the desired roughness, sample possible half-angle vectors, and compute the lighting vector from them
-        vec3 H = basis * importance_sample_ggx(roughness_to_alpha(u_roughness), i, 1024);
-        vec3 L = normalize(2 * dot(V, H) * H - V);
+        const vec3 H = basis * importance_sample_ggx(alpha, i, sample_count);
+        const vec3 L = normalize(2*dot(V,H)*H - V);
         if(dot(N, L) <= 0) continue;
 
+        // Compute the mip-level at which to sample
+        const float D = trowbridge_reitz_ggx(N, H, alpha);
+        const float pdf = D*dotp(N,H) / (4*dotp(V,H)) + 0.0001; 
+        const float sample_solid_angle = 1 / (sample_count * pdf + 0.0001);
+        const float mip_level = alpha > 0 ? log2(sample_solid_angle / texel_solid_angle)/2 : 0;
+
         // Sample the environment map according to the lighting direction, and weight the resulting contribution by N dot L
-        sum_color += texture(u_texture, L).rgb * dot(N, L);
+        sum_color += textureLod(u_texture, L, mip_level).rgb * dot(N, L);
         sum_weight += dot(N, L);
     }
 
@@ -262,6 +274,7 @@ constexpr char brdf_integration_frag_shader_source[] = R"(
 layout(location=0) in vec2 texcoords;
 layout(location=0) out vec4 f_color;
 
+const int sample_count = 1024;
 vec2 integrate_brdf(float n_dot_v, float alpha)
 {
     // Without loss of generality, evaluate the case where the normal is aligned with the z-axis and the viewing direction is in the xz-plane
@@ -269,11 +282,11 @@ vec2 integrate_brdf(float n_dot_v, float alpha)
     const vec3 V = vec3(sqrt(1 - n_dot_v*n_dot_v), 0, n_dot_v);
 
     vec2 result = vec2(0,0);    
-    for(int i=0; i<1024; ++i)
+    for(int i=0; i<sample_count; ++i)
     {
         // For the desired roughness, sample possible half-angle vectors, and compute the lighting vector from them
-        vec3 H = importance_sample_ggx(alpha, i, 1024);
-        vec3 L = normalize(2 * dot(V, H) * H - V);
+        const vec3 H = importance_sample_ggx(alpha, i, sample_count);
+        const vec3 L = normalize(2 * dot(V, H) * H - V);
         if(dot(N, L) <= 0) continue;
 
         // Integrate results
@@ -283,7 +296,7 @@ vec2 integrate_brdf(float n_dot_v, float alpha)
         result.x += (1 - Fc) * G_Vis;
         result.y += Fc * G_Vis;
     }
-    return result/1024;
+    return result/sample_count;
 }
 void main() 
 {
