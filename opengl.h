@@ -2,6 +2,7 @@
 #define OPENGL_H
 
 #include <vector>
+#include <optional>
 #include <string_view>
 
 #include "3rdparty/linalg.h"
@@ -24,17 +25,18 @@ public:
     gl_program(gl_program && r) : gl_program() { *this = std::move(r); }
     ~gl_program();
 
-    void use() const { glUseProgram(program); }
+    void use() const;
+    std::optional<GLint> get_uniform_location(const char * name) const;
 
-    void bind_texture(GLint location, GLuint texture) const { GLint binding; glGetUniformiv(program, location, &binding); glBindTextureUnit(binding, texture); }
-    void bind_texture(const char * name, GLuint texture) const { const GLint location = glGetUniformLocation(program, name); if(location >= 0) bind_texture(location, texture); }
+    void bind_texture(GLint location, GLuint texture) const;
+    void bind_texture(const char * name, GLuint texture) const { if(auto loc = get_uniform_location(name)) bind_texture(*loc, texture); }
 
-    void uniform(GLint location, float scalar) { glProgramUniform1f(program, location, scalar); }
-    void uniform(GLint location, const float2 & vec) { glProgramUniform2fv(program, location, 1, &vec[0]); }
-    void uniform(GLint location, const float3 & vec) { glProgramUniform3fv(program, location, 1, &vec[0]); }
-    void uniform(GLint location, const float4 & vec) { glProgramUniform4fv(program, location, 1, &vec[0]); }
-    void uniform(GLint location, const float4x4 & mat) { glProgramUniformMatrix4fv(program, location, 1, GL_FALSE, &mat[0][0]); }
-    template<class T> void uniform(const char * name, const T & value) { const GLint location = glGetUniformLocation(program, name); if(location < 0) return; uniform(location, value); }
+    void uniform(GLint location, float scalar);
+    void uniform(GLint location, const float2 & vec);
+    void uniform(GLint location, const float3 & vec);
+    void uniform(GLint location, const float4 & vec);
+    void uniform(GLint location, const float4x4 & mat);
+    template<class T> void uniform(const char * name, const T & value) { if(auto loc = get_uniform_location(name)) uniform(*loc, value); }
 
     gl_program & operator = (gl_program && r) { std::swap(program, r.program); return *this; }
 };

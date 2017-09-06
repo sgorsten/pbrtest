@@ -59,6 +59,22 @@ gl_program::gl_program(std::initializer_list<GLuint> shader_stages) : gl_program
 
 gl_program::~gl_program() { if(program) glDeleteProgram(program); }
 
+void gl_program::use() const { glUseProgram(program); }
+std::optional<int> gl_program::get_uniform_location(const char * name) const 
+{ 
+    const GLint location = glGetUniformLocation(program, name);
+    if(location < 0) return std::nullopt;
+    return location;
+}
+
+void gl_program::bind_texture(GLint location, GLuint texture) const { GLint binding; glGetUniformiv(program, location, &binding); glBindTextureUnit(binding, texture); }
+
+void gl_program::uniform(GLint location, float scalar) { glProgramUniform1f(program, location, scalar); }
+void gl_program::uniform(GLint location, const float2 & vec) { glProgramUniform2fv(program, location, 1, &vec[0]); }
+void gl_program::uniform(GLint location, const float3 & vec) { glProgramUniform3fv(program, location, 1, &vec[0]); }
+void gl_program::uniform(GLint location, const float4 & vec) { glProgramUniform4fv(program, location, 1, &vec[0]); }
+void gl_program::uniform(GLint location, const float4x4 & mat) { glProgramUniformMatrix4fv(program, location, 1, GL_FALSE, &mat[0][0]); }
+
 std::string_view preamble = R"(#version 450
 const float pi = 3.14159265359, tau = 6.28318530718;
 float dotp(vec3 a, vec3 b) { return max(dot(a,b),0); }
