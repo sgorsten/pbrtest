@@ -62,16 +62,34 @@ GLuint link_program(std::initializer_list<GLuint> shader_stages)
 
 
 std::string_view preamble = R"(#version 450
-const float PI = 3.14159265359;
+const float pi = 3.14159265359, tau = 6.28318530718;
 float dotp(vec3 a, vec3 b) { return max(dot(a,b),0); }
 float pow2(float x) { return x*x; }
 float length2(vec3 v) { return dot(v,v); }
-float geometry_smith(vec3 N, vec3 V, vec3 L, float k)
+
+// Our physically based lighting equations use the following common terminology
+// N - normal vector, unit vector perpendicular to the surface
+// V - view vector, unit vector pointing from the surface towards the viewer
+// L - light vector, unit vector pointing from the surface towards the light source
+// H - half-angle vector, unit vector halfway between V and L
+// R - reflection vector, V mirrored about N
+// F0 - base reflectance of the surface
+// alpha - common measure of surface roughness
+float roughness_to_alpha(float roughness) { return roughness*roughness; }
+float trowbridge_reitz_ggx(vec3 N, vec3 H, float alpha) { return alpha*alpha / (pi * pow2(dotp(N,H)*dotp(N,H)*(alpha*alpha-1) + 1)); }
+float geometry_schlick_ggx(vec3 N, vec3 V, float k) { return dotp(N,V) / (dotp(N,V)*(1-k) + k); }
+float geometry_smith(vec3 N, vec3 V, vec3 L, float k) { return geometry_schlick_ggx(N, L, k) * geometry_schlick_ggx(N, V, k); }
+vec3 fresnel_schlick(vec3 V, vec3 H, vec3 F0) { return F0 + (1-F0) * pow(1-dotp(V,H), 5); }
+vec3 cook_torrance(vec3 N, vec3 V, vec3 L, vec3 H, vec3 albedo, vec3 F0, float alpha, float metalness)
 {
-    const float Gl = dotp(N,L) / (dotp(N,L)*(1-k) + k); // Schlick-GGX geometry function for lighting direction
-    const float Gv = dotp(N,V) / (dotp(N,V)*(1-k) + k); // Schlick-GGX geometry function for viewing direction
-    return Gl * Gv;
+    const float D       = trowbridge_reitz_ggx(N, H, alpha);
+    const float G       = geometry_smith(N, V, L, (alpha+1)*(alpha+1)/8);
+    const vec3 F        = fresnel_schlick(V, H, F0);
+    const vec3 diffuse  = (1-F) * (1-metalness) * albedo/pi;
+    const vec3 specular = (D * G * F) / (4 * dotp(N,V) * dotp(N,L) + 0.001);  
+    return (diffuse + specular) * dotp(N,L);
 }
+
 vec3 spherical(float phi, float cos_theta, float sin_theta) { return vec3(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta); };
 vec3 spherical(float phi, float theta) { return spherical(phi, cos(theta), sin(theta)); }
 mat3 tangent_basis(vec3 z_direction)
@@ -94,51 +112,35 @@ const float MAX_REFLECTANCE_LOD = 4.0;
 
 vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, float metalness, float ambient_occlusion)
 {
-    // Compute normal vector, view vector, and reflection vector
+    // Compute common terms of lighting equations
     const vec3 N = normalize(normal);
     const vec3 V = normalize(u_eye_position - position);
     const vec3 R = reflect(-V, N);
-
-    // Compute F0: The base reflectivity of the surface
     const vec3 F0 = mix(vec3(0.04), albedo, metalness);
+    const float alpha = roughness_to_alpha(roughness);
 
+    // Initialize our light accumulator
     vec3 light = vec3(0,0,0);
 
-    // Add contribution from ambient light
+    // Add contribution from indirect lights
     {
-        vec2 env_brdf = texture(u_brdf_integration_map, vec2(dotp(N,V), roughness)).xy;
-        vec3 F        = F0 + max(1-F0-roughness, 0) * pow(1-dotp(N,V), 5);
-        vec3 specular = (F * env_brdf.x + env_brdf.y) * textureLod(u_reflectance_map, R, roughness * MAX_REFLECTANCE_LOD).rgb;
-        vec3 diffuse  = (1-F) * (1-metalness) * albedo * texture(u_irradiance_map, N).rgb;
-        light         += (diffuse + specular) * ambient_occlusion; 
+        vec2 brdf = texture(u_brdf_integration_map, vec2(dotp(N,V), roughness)).xy;
+        vec3 F    = F0 + max(1-F0-roughness, 0) * pow(1-dotp(N,V), 5);
+        vec3 spec = (F * brdf.x + brdf.y) * textureLod(u_reflectance_map, R, roughness * MAX_REFLECTANCE_LOD).rgb;
+        vec3 diff = (1-F) * (1-metalness) * albedo * texture(u_irradiance_map, N).rgb;
+        light     += (diff + spec) * ambient_occlusion; 
     }
 
-    // Add contributions from point lights
-    vec3 light_positions[4] = {vec3(-3, -3, 8), vec3(3, -3, 8), vec3(3, 3, 8), vec3(-3, 3, 8)};
-    vec3 light_colors[4] = {vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79)};
+    // Add contributions from direct lights
+    const vec3 light_positions[4] = {vec3(-3, -3, 8), vec3(3, -3, 8), vec3(3, 3, 8), vec3(-3, 3, 8)};
+    const vec3 light_colors[4] = {vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79)};
     for(int i=0; i<4; ++i)
     {
-        // Evaluate light vector and half-angle vector
+        // Evaluate light vector, half-angle vector, and radiance of light source at the current distance
         const vec3 L = normalize(light_positions[i] - position);
         const vec3 H = normalize(V + L);
-
-        // Evaluate radiance of light source at the current distance
         const vec3 radiance = light_colors[i] / length2(light_positions[i] - position);
-
-        // Evaluate Trowbridge-Reitz GGX normal distribution function
-        const float alpha = roughness*roughness;
-        const float D = alpha*alpha / (PI * pow2(dotp(N,H)*dotp(N,H)*(alpha*alpha-1) + 1));
-
-        // Evaluate Smith's Schlick-GGX geometry function
-        const float G = geometry_smith(N,V,L,(alpha+1)*(alpha+1)/8);
-
-        // Evaluate Fresnel-Schlick approximation to Fresnel equation
-        const vec3 F = F0 + (1-F0) * pow(1-dotp(V,H), 5);
-
-        // Evaluate Cook-Torrance BRDF
-        const vec3 diffuse = (1-F) * (1-metalness) * albedo/PI;
-        const vec3 specular = (D * G * F) / (4 * dotp(N,V) * dotp(N,L) + 0.001);  
-        light += (diffuse + specular) * radiance * dotp(N,L);
+        light += radiance * cook_torrance(N, V, L, H, albedo, F0, alpha, metalness);
     }
     return light;
 }
@@ -186,24 +188,24 @@ void main()
 
     vec3 irradiance = vec3(0,0,0);
     float num_samples = 0; 
-    for(float phi = 0; phi < PI*2; phi += 0.01)
+    for(float phi=0; phi<tau; phi+=0.01)
     {
-        for(float theta = 0; theta < PI*0.5; theta += 0.01)
+        for(float theta=0; theta<tau/4; theta+=0.01)
         {
             // Sample irradiance from the source texture, and weight by the sampling area
             vec3 L = basis * spherical(phi, theta);
             irradiance += texture(u_texture, L).rgb * cos(theta) * sin(theta);
-            num_samples++;
+            ++num_samples;
         }
     }
-    f_color = vec4(PI * irradiance / num_samples, 1);
+    f_color = vec4(irradiance*(pi/num_samples), 1);
 })";
 
 constexpr char importance_sample_ggx[] = R"(  
 vec3 importance_sample_ggx(float alpha, uint i, uint n)
 {
     // Phi is distributed uniformly over the integration range
-    const float phi = i * 2.0 * PI / n;
+    const float phi = i*tau/n;
 
     // Theta is importance-sampled using the Van Der Corpus sequence
     i = (i << 16u) | (i >> 16u);
@@ -234,7 +236,7 @@ void main()
     for(int i=0; i<1024; ++i)
     {
         // For the desired roughness, sample possible half-angle vectors, and compute the lighting vector from them
-        vec3 H = basis * importance_sample_ggx(u_roughness*u_roughness, i, 1024);
+        vec3 H = basis * importance_sample_ggx(roughness_to_alpha(u_roughness), i, 1024);
         vec3 L = normalize(2 * dot(V, H) * H - V);
         if(dot(N, L) <= 0) continue;
 
@@ -260,7 +262,7 @@ constexpr char brdf_integration_frag_shader_source[] = R"(
 layout(location=0) in vec2 texcoords;
 layout(location=0) out vec4 f_color;
 
-vec2 integrate_brdf(float n_dot_v, float roughness)
+vec2 integrate_brdf(float n_dot_v, float alpha)
 {
     // Without loss of generality, evaluate the case where the normal is aligned with the z-axis and the viewing direction is in the xz-plane
     const vec3 N = vec3(0,0,1);
@@ -270,13 +272,13 @@ vec2 integrate_brdf(float n_dot_v, float roughness)
     for(int i=0; i<1024; ++i)
     {
         // For the desired roughness, sample possible half-angle vectors, and compute the lighting vector from them
-        vec3 H = importance_sample_ggx(roughness*roughness, i, 1024);
+        vec3 H = importance_sample_ggx(alpha, i, 1024);
         vec3 L = normalize(2 * dot(V, H) * H - V);
         if(dot(N, L) <= 0) continue;
 
         // Integrate results
         const float Fc = pow(1 - dotp(V,H), 5);
-        const float G = geometry_smith(N,V,L,roughness*roughness/2);
+        const float G = geometry_smith(N, V, L, alpha*alpha/2);
         const float G_Vis = (G * dotp(V,H)) / (dotp(N,H) * n_dot_v);
         result.x += (1 - Fc) * G_Vis;
         result.y += Fc * G_Vis;
@@ -285,7 +287,7 @@ vec2 integrate_brdf(float n_dot_v, float roughness)
 }
 void main() 
 {
-    f_color = vec4(integrate_brdf(texcoords.x, texcoords.y), 0, 1);
+    f_color = vec4(integrate_brdf(texcoords.x, roughness_to_alpha(texcoords.y)), 0, 1);
 })";
 
 pbr_tools::pbr_tools()
