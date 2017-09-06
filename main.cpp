@@ -1,5 +1,6 @@
 #include <vector>
 #include <iostream>
+#include <optional>
 #include <string_view>
 #include <chrono>
 using hr_clock = std::chrono::high_resolution_clock;
@@ -125,8 +126,8 @@ int main() try
 
     glewInit();
     pbr_tools tools;
-    auto prog = link_program({compile_shader(GL_VERTEX_SHADER, {preamble, vert_shader_source}), 
-                              compile_shader(GL_FRAGMENT_SHADER, {preamble, pbr_lighting, frag_shader_source})});
+    gl_program prog {compile_shader(GL_VERTEX_SHADER, {preamble, vert_shader_source}), 
+                     compile_shader(GL_FRAGMENT_SHADER, {preamble, pbr_lighting, frag_shader_source})};
 
     // Set up a right-handed, x-right, y-down, z-forward coordinate system with a 0-to-1 depth buffer
     glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
@@ -198,14 +199,13 @@ int main() try
         if(glfwGetKey(win, GLFW_KEY_3)) env_index=2;
 
         // Set up scene
-        const float4x4 view_matrix = cam.get_view_matrix();
-        const float4x4 proj_matrix = linalg::perspective_matrix(1.0f, (float)1280/720, 0.1f, 32.0f, linalg::pos_z, linalg::zero_to_one);
-        const float4x4 view_proj_matrix = mul(proj_matrix, view_matrix);
-
-        // Render skybox
         glfwGetFramebufferSize(win, &width, &height);
         glViewport(0, 0, width, height);
         glClear(GL_DEPTH_BUFFER_BIT);
+        const float4x4 view_matrix = cam.get_view_matrix();
+        const float4x4 proj_matrix = linalg::perspective_matrix(1.0f, (float)width/height, 0.1f, 32.0f, linalg::pos_z, linalg::zero_to_one);
+
+        // Render skybox
         tools.draw_skybox(env[env_index].environment_cubemap, mul(proj_matrix, cam.get_skybox_view_matrix()));
 
         // Render spheres
@@ -213,31 +213,26 @@ int main() try
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().position[0]);
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().normal[0]);
 
-        glUseProgram(prog);
-        glBindTextureUnit(0, env[env_index].irradiance_cubemap);
-        glBindTextureUnit(1, env[env_index].reflectance_cubemap);
-        glBindTextureUnit(2, brdf_integration_map);
+        prog.bind_texture("u_brdf_integration_map", brdf_integration_map);
+        prog.bind_texture("u_irradiance_map", env[env_index].irradiance_cubemap);
+        prog.bind_texture("u_reflectance_map", env[env_index].reflectance_cubemap);
 
-        glUniform1i(glGetUniformLocation(prog, "u_irradiance_map"), 0);
-        glUniform1i(glGetUniformLocation(prog, "u_reflectance_map"), 1);
-        glUniform1i(glGetUniformLocation(prog, "u_brdf_integration_map"), 2);
-        glUniformMatrix4fv(glGetUniformLocation(prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
-        glUniform3fv(glGetUniformLocation(prog, "u_eye_position"), 1, &cam.position[0]);
+        prog.use();
+        prog.uniform("u_view_proj_matrix", mul(proj_matrix, view_matrix));
+        prog.uniform("u_eye_position", cam.position);
 
+        prog.uniform("u_ambient_occlusion", 1.0f);
         const float3 albedos[] {{1,1,1}, {1,0,0}, {1,1,0}, {0,1,0}, {0,1,1}, {0,0,1}, {1,0,1}};
-        glUniform1f(glGetUniformLocation(prog, "u_ambient_occlusion"), 1.0f);
         for(int i=0; i<7; ++i)
         {
             for(int j=0; j<7; ++j)
             {
                 for(int k=0; k<7; ++k)
-                {
-                    const float3 position {j-3.0f, i-3.0f, k-3.0f};
-                    const float4x4 model_matrix = translation_matrix(position);
-                    glUniformMatrix4fv(glGetUniformLocation(prog, "u_model_matrix"), 1, GL_FALSE, &model_matrix[0][0]);
-                    glUniform3fv(glGetUniformLocation(prog, "u_albedo"), 1, &albedos[k][0]);
-                    glUniform1f(glGetUniformLocation(prog, "u_metalness"), 1-(i+0.5f)/7);
-                    glUniform1f(glGetUniformLocation(prog, "u_roughness"), (j+0.5f)/7);
+                {                    
+                    prog.uniform("u_model_matrix", translation_matrix(float3{j-3.0f, i-3.0f, k-3.0f}));
+                    prog.uniform("u_albedo", albedos[k]);
+                    prog.uniform("u_metalness", 1-(i+0.5f)/7);
+                    prog.uniform("u_roughness", (j+0.5f)/7);
                     glDrawArrays(GL_QUADS, 0, sphere_verts.size());
                 }
             }

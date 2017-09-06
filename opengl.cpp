@@ -38,9 +38,9 @@ GLuint compile_shader(GLenum type, std::initializer_list<std::string_view> sourc
     return shader;
 }
 
-GLuint link_program(std::initializer_list<GLuint> shader_stages)
+gl_program::gl_program(std::initializer_list<GLuint> shader_stages) : gl_program{}
 {
-    const GLuint program = glCreateProgram();
+    program = glCreateProgram();
     for(auto shader : shader_stages) glAttachShader(program, shader);
     glLinkProgram(program);
 
@@ -53,13 +53,11 @@ GLuint link_program(std::initializer_list<GLuint> shader_stages)
 
         std::vector<GLchar> info_log(info_log_length);
         glGetProgramInfoLog(program, info_log.size(), nullptr, info_log.data());
-        glDeleteProgram(program);
         throw std::runtime_error(info_log.data());
     }
-
-    return program;
 }
 
+gl_program::~gl_program() { if(program) glDeleteProgram(program); }
 
 std::string_view preamble = R"(#version 450
 const float pi = 3.14159265359, tau = 6.28318530718;
@@ -102,14 +100,12 @@ mat3 tangent_basis(vec3 z_direction)
 )";
 
 std::string_view pbr_lighting = R"(
-
 // This function computes the full lighting to apply to a single fragment
 uniform vec3 u_eye_position;
-uniform samplerCube u_irradiance_map;
-uniform samplerCube u_reflectance_map;
-uniform sampler2D u_brdf_integration_map;
+layout(binding=0) uniform sampler2D u_brdf_integration_map;
+layout(binding=1) uniform samplerCube u_irradiance_map;
+layout(binding=2) uniform samplerCube u_reflectance_map;
 const float MAX_REFLECTANCE_LOD = 4.0;
-
 vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, float metalness, float ambient_occlusion)
 {
     // Compute common terms of lighting equations
@@ -307,11 +303,11 @@ pbr_tools::pbr_tools()
 {
     GLuint skybox_vs           = compile_shader(GL_VERTEX_SHADER, {preamble, skybox_vert_shader_source});
     GLuint fullscreen_pass_vs  = compile_shader(GL_VERTEX_SHADER, {preamble, fullscreen_pass_vert_shader_source});
-    spheremap_skybox_prog      = link_program({skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, spheremap_skybox_frag_shader_source})});
-    cubemap_skybox_prog        = link_program({skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_skybox_frag_shader_source})});
-    irradiance_prog            = link_program({skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, irradiance_frag_shader_source})});
-    reflectance_prog           = link_program({skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, reflectance_frag_shader_source})});
-    brdf_integration_prog      = link_program({fullscreen_pass_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, brdf_integration_frag_shader_source})});
+    spheremap_skybox_prog      = {skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, spheremap_skybox_frag_shader_source})};
+    cubemap_skybox_prog        = {skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_skybox_frag_shader_source})};
+    irradiance_prog            = {skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, irradiance_frag_shader_source})};
+    reflectance_prog           = {skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, reflectance_frag_shader_source})};
+    brdf_integration_prog      = {fullscreen_pass_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, brdf_integration_frag_shader_source})};
 }
 
 template<class F> GLuint render_cubemap(GLsizei levels, GLenum internal_format, GLsizei width, F draw_face)
@@ -361,11 +357,11 @@ constexpr float3 skybox_verts[]
 
 GLuint pbr_tools::convert_spheremap_to_cubemap(GLenum internal_format, GLsizei width, GLuint spheremap) const
 {
-    glUseProgram(spheremap_skybox_prog);
-    glBindTexture(GL_TEXTURE_2D, spheremap);
+    spheremap_skybox_prog.bind_texture("u_texture", spheremap);
+    spheremap_skybox_prog.use();
     return render_cubemap(0, internal_format, width, [&](const float4x4 & view_proj_matrix, int mip)
     {        
-        glUniformMatrix4fv(glGetUniformLocation(spheremap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+        spheremap_skybox_prog.uniform("u_view_proj_matrix", view_proj_matrix);
         glBegin(GL_QUADS);
         for(auto & v : skybox_verts) glVertex3fv(&v[0]);
         glEnd();
@@ -374,11 +370,11 @@ GLuint pbr_tools::convert_spheremap_to_cubemap(GLenum internal_format, GLsizei w
 
 GLuint pbr_tools::compute_irradiance_map(GLuint cubemap) const
 {
-    glUseProgram(irradiance_prog);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+    irradiance_prog.bind_texture("u_texture", cubemap);
+    irradiance_prog.use();
     return render_cubemap(1, GL_RGB16F, 32, [&](const float4x4 & view_proj_matrix, int mip)
     {
-        glUniformMatrix4fv(glGetUniformLocation(irradiance_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+        irradiance_prog.uniform("u_view_proj_matrix", view_proj_matrix);
         glBegin(GL_QUADS);
         for(auto & v : skybox_verts) glVertex3fv(&v[0]);
         glEnd();
@@ -387,12 +383,12 @@ GLuint pbr_tools::compute_irradiance_map(GLuint cubemap) const
 
 GLuint pbr_tools::compute_reflectance_map(GLuint cubemap) const
 {
-    glUseProgram(reflectance_prog);
-    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+    reflectance_prog.bind_texture("u_texture", cubemap);
+    reflectance_prog.use();;
     return render_cubemap(5, GL_RGB16F, 128, [&](const float4x4 & view_proj_matrix, int mip)
     {
-        glUniformMatrix4fv(glGetUniformLocation(reflectance_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
-        glUniform1f(glGetUniformLocation(reflectance_prog, "u_roughness"), mip/4.0f);
+        reflectance_prog.uniform("u_view_proj_matrix", view_proj_matrix);
+        reflectance_prog.uniform("u_roughness", mip/4.0f);
         glBegin(GL_QUADS);
         for(auto & v : skybox_verts) glVertex3fv(&v[0]);
         glEnd();
@@ -415,7 +411,7 @@ GLuint pbr_tools::compute_brdf_integration_map() const
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, brdf_integration_map, 0);
     glViewport(0,0,512,512);
 
-    glUseProgram(brdf_integration_prog);
+    brdf_integration_prog.use();
     glBegin(GL_QUADS);
     glVertexAttrib2f(1, 0, 0); glVertex2f(-1, -1);
     glVertexAttrib2f(1, 0, 1); glVertex2f(-1, +1);
@@ -431,14 +427,12 @@ GLuint pbr_tools::compute_brdf_integration_map() const
 
 void pbr_tools::draw_skybox(GLuint cubemap, const float4x4 & skybox_view_proj_matrix) const
 {
-    glUseProgram(cubemap_skybox_prog);
-    glUniformMatrix4fv(glGetUniformLocation(cubemap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &skybox_view_proj_matrix[0][0]);
-    glUniform1i(glGetUniformLocation(cubemap_skybox_prog, "u_texture"), 0);
-    glBindTextureUnit(0, cubemap);
+    cubemap_skybox_prog.bind_texture("u_texture", cubemap);
+    cubemap_skybox_prog.uniform("u_view_proj_matrix", skybox_view_proj_matrix);
+    cubemap_skybox_prog.use();
     glDepthMask(GL_FALSE);
     glBegin(GL_QUADS);
     for(auto & v : skybox_verts) glVertex3fv(&v[0]);
     glEnd();
     glDepthMask(GL_TRUE);
 }
-
