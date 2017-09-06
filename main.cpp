@@ -77,6 +77,31 @@ std::vector<vertex> make_sphere(int slices, int stacks, float radius)
 #define STB_IMAGE_IMPLEMENTATION
 #include "3rdparty/stb_image.h"
 
+struct environment { GLuint environment_cubemap, irradiance_cubemap, reflectance_cubemap; };
+
+environment load_enviroment(const pbr_tools & tools, const char * filename)
+{
+    // Load spheremap
+    int width, height;
+    float * pixels = stbi_loadf(filename, &width, &height, nullptr, 3);
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, width, height, 0, GL_RGB, GL_FLOAT, pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    stbi_image_free(pixels);
+
+    // Compute environment maps
+    const GLuint environment_cubemap = tools.convert_spheremap_to_cubemap(GL_RGB16F, 1024, tex);
+    const GLuint irradiance_cubemap = tools.compute_irradiance_map(environment_cubemap);
+    const GLuint reflectance_cubemap = tools.compute_reflectance_map(environment_cubemap);
+    glDeleteTextures(1, &tex);
+    return {environment_cubemap, irradiance_cubemap, reflectance_cubemap};
+}
+
 int main() try
 {
     auto sphere_verts = make_sphere(32,16,0.4f);
@@ -124,10 +149,13 @@ int main() try
     stbi_image_free(pixels);
 
     // Convert spheremap to cubemap
-    const GLuint environment_cubemap = tools.convert_spheremap_to_cubemap(GL_RGB16F, 1024, tex);
-    const GLuint irradiance_cubemap = tools.compute_irradiance_map(environment_cubemap);
-    const GLuint reflectance_cubemap = tools.compute_reflectance_map(environment_cubemap);    
     const GLuint brdf_integration_map = tools.compute_brdf_integration_map();
+    const environment env[2]
+    {
+        load_enviroment(tools, "monument-valley.hdr"),
+        load_enviroment(tools, "factory-catwalk.hdr")
+    };
+    int env_index = 0;
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glEnable(GL_FRAMEBUFFER_SRGB);
@@ -164,6 +192,9 @@ int main() try
         if(glfwGetKey(win, GLFW_KEY_D)) move.x += 1;
         if(length(move) > 0) cam.move_local(normalize(move) * (cam_speed * timestep));
 
+        if(glfwGetKey(win, GLFW_KEY_1)) env_index=0;
+        if(glfwGetKey(win, GLFW_KEY_2)) env_index=1;
+
         // Set up scene
         const float4x4 view_matrix = cam.get_view_matrix();
         const float4x4 proj_matrix = linalg::perspective_matrix(1.0f, (float)1280/720, 0.1f, 32.0f, linalg::pos_z, linalg::zero_to_one);
@@ -173,7 +204,7 @@ int main() try
         glfwGetFramebufferSize(win, &width, &height);
         glViewport(0, 0, width, height);
         glClear(GL_DEPTH_BUFFER_BIT);
-        tools.draw_skybox(environment_cubemap, mul(proj_matrix, cam.get_skybox_view_matrix()));
+        tools.draw_skybox(env[env_index].environment_cubemap, mul(proj_matrix, cam.get_skybox_view_matrix()));
 
         // Render spheres
         for(int i : {0,1}) glEnableVertexAttribArray(i);
@@ -181,8 +212,8 @@ int main() try
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(vertex), &sphere_verts.front().normal[0]);
 
         glUseProgram(prog);
-        glBindTextureUnit(0, irradiance_cubemap);
-        glBindTextureUnit(1, reflectance_cubemap);
+        glBindTextureUnit(0, env[env_index].irradiance_cubemap);
+        glBindTextureUnit(1, env[env_index].reflectance_cubemap);
         glBindTextureUnit(2, brdf_integration_map);
 
         glUniform1i(glGetUniformLocation(prog, "u_irradiance_map"), 0);
