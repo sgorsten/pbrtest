@@ -186,7 +186,7 @@ int main() try
         glBindTextureUnit(2, brdf_integration_map);
 
         glUniform1i(glGetUniformLocation(prog, "u_irradiance_map"), 0);
-        glUniform1i(glGetUniformLocation(prog, "u_prefiltered_map"), 1);
+        glUniform1i(glGetUniformLocation(prog, "u_reflectance_map"), 1);
         glUniform1i(glGetUniformLocation(prog, "u_brdf_integration_map"), 2);
         glUniformMatrix4fv(glGetUniformLocation(prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
         glUniform3fv(glGetUniformLocation(prog, "u_eye_position"), 1, &cam.position[0]);

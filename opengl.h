@@ -22,8 +22,8 @@ class pbr_tools
 {
     GLuint spheremap_skybox_prog;
     GLuint cubemap_skybox_prog;
-    GLuint cubemap_convolution_prog;
-    GLuint prefilter_prog;
+    GLuint irradiance_prog;
+    GLuint reflectance_prog;
     GLuint brdf_integration_prog;
 public:
     pbr_tools();
@@ -33,7 +33,7 @@ public:
     GLuint compute_reflectance_map(GLuint cubemap) const;
     GLuint compute_brdf_integration_map() const;
 
-    void draw_skybox(GLuint cubemap, const float4x4 & view_proj_matrix) const;
+    void draw_skybox(GLuint cubemap, const float4x4 & skybox_view_proj_matrix) const;
 };
 
 #endif

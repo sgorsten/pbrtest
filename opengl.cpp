@@ -1,4 +1,5 @@
 #include "opengl.h"
+#include <sstream>
 
 GLuint compile_shader(GLenum type, std::initializer_list<std::string_view> sources)
 {
@@ -27,7 +28,11 @@ GLuint compile_shader(GLenum type, std::initializer_list<std::string_view> sourc
         std::vector<GLchar> info_log(info_log_length);
         glGetShaderInfoLog(shader, info_log.size(), nullptr, info_log.data());
         glDeleteShader(shader);
-        throw std::runtime_error(info_log.data());
+
+        std::ostringstream ss;
+        ss << "compile_shader(...) failed with log:\n" << info_log.data() << "and sources:\n";
+        for(auto source : sources) ss << source;
+        throw std::runtime_error(ss.str());
     }
 
     return shader;
@@ -56,107 +61,88 @@ GLuint link_program(std::initializer_list<GLuint> shader_stages)
 }
 
 
-std::string_view preamble = "#version 450\nconst float PI = 3.14159265359;\n";
+std::string_view preamble = R"(#version 450
+const float PI = 3.14159265359;
+float dotp(vec3 a, vec3 b) { return max(dot(a,b),0); }
+float pow2(float x) { return x*x; }
+float length2(vec3 v) { return dot(v,v); }
+float geometry_smith(vec3 N, vec3 V, vec3 L, float k)
+{
+    const float Gl = dotp(N,L) / (dotp(N,L)*(1-k) + k); // Schlick-GGX geometry function for lighting direction
+    const float Gv = dotp(N,V) / (dotp(N,V)*(1-k) + k); // Schlick-GGX geometry function for viewing direction
+    return Gl * Gv;
+}
+vec3 spherical(float phi, float cos_theta, float sin_theta) { return vec3(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta); };
+vec3 spherical(float phi, float theta) { return spherical(phi, cos(theta), sin(theta)); }
+mat3 tangent_basis(vec3 z_direction)
+{
+    const vec3 z = normalize(z_direction);    
+    const vec3 x = normalize(cross(abs(z.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0), z));
+    const vec3 y = cross(z, x);
+    return mat3(x, y, z);
+}
+)";
 
 std::string_view pbr_lighting = R"(
-
-// This structure contains the essential information about a fragment to compute lighting for it
-struct pbr_surface
-{
-    vec3 normal_vec;        // unit vector perpendicular to the surface
-    vec3 eye_vec;           // unit vector pointing from the surface to the viewer
-    float n_dot_v;          // max(dot(normal_vec, eye_vec), 0)
-    vec3 diffuse_albedo;    // (1-metalness) * albedo/PI
-    vec3 base_reflectivity; // F0
-    float alpha;            // roughness^2
-    float k;                // computed different for direct and indirect lighting
-};
-
-// This function computes the contribution of a single light to a fragment
-vec3 compute_contribution(pbr_surface surf, vec3 light_vec, vec3 radiance)
-{
-    // Compute half vector and precompute some dot products
-    vec3 half_vec = normalize(surf.eye_vec + light_vec);
-    float n_dot_l = max(dot(surf.normal_vec, light_vec), 0);
-    float n_dot_h = max(dot(surf.normal_vec, half_vec), 0);    
-    float v_dot_h = max(dot(surf.eye_vec, half_vec), 0);
-
-    // Evaluate Trowbridge-Reitz GGX normal distribution function
-    float denom = n_dot_h*n_dot_h*(surf.alpha*surf.alpha-1) + 1;
-    denom = PI * denom * denom;
-    float D = (surf.alpha*surf.alpha) / denom;
-
-    // Evaluate Smith's Schlick-GGX geometry function
-    float ggx1 = n_dot_l / (n_dot_l*(1-surf.k) + surf.k);
-    float ggx2 = surf.n_dot_v / (surf.n_dot_v*(1-surf.k) + surf.k);
-    float G = ggx1 * ggx2;
-
-    // Evaluate Fresnel-Schlick approximation to Fresnel equation
-    vec3 F = surf.base_reflectivity + (1-surf.base_reflectivity) * pow(1-v_dot_h, 5);
-
-    // Evaluate Cook-Torrance specular BRDF
-    vec3 specular = (D * G * F) / (4 * surf.n_dot_v * n_dot_l + 0.001);  
-
-    // Compute diffuse contribution
-    vec3 diffuse = (1-F) * surf.diffuse_albedo;
-
-    // Return total contribution from this light
-    return (diffuse + specular) * radiance * n_dot_l;
-}
 
 // This function computes the full lighting to apply to a single fragment
 uniform vec3 u_eye_position;
 uniform samplerCube u_irradiance_map;
-uniform samplerCube u_prefiltered_map;
+uniform samplerCube u_reflectance_map;
 uniform sampler2D u_brdf_integration_map;
-
-vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
-{
-    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(1.0 - cosTheta, 5.0);
-} 
+const float MAX_REFLECTANCE_LOD = 4.0;
 
 vec3 compute_lighting(vec3 position, vec3 normal, vec3 albedo, float roughness, float metalness, float ambient_occlusion)
 {
-    pbr_surface surf;
-    surf.normal_vec = normalize(normal);
-    surf.eye_vec = normalize(u_eye_position - position);
-    surf.n_dot_v = max(dot(surf.normal_vec, surf.eye_vec), 0);
-    surf.base_reflectivity = mix(vec3(0.04), albedo, metalness);
-    surf.diffuse_albedo = (1-metalness) * albedo/PI;
-    surf.alpha = roughness*roughness;
-    surf.k = (roughness+1)*(roughness+1)/8;
+    // Compute normal vector, view vector, and reflection vector
+    const vec3 N = normalize(normal);
+    const vec3 V = normalize(u_eye_position - position);
+    const vec3 R = reflect(-V, N);
 
-    // Initialize ambient light amount
+    // Compute F0: The base reflectivity of the surface
+    const vec3 F0 = mix(vec3(0.04), albedo, metalness);
 
-    vec3 R = reflect(-surf.eye_vec, surf.normal_vec);   
-    const float MAX_REFLECTION_LOD = 4.0;
-    vec3 prefilteredColor = textureLod(u_prefiltered_map, R, roughness * MAX_REFLECTION_LOD).rgb;    
+    vec3 light = vec3(0,0,0);
 
-    vec3 F          = fresnelSchlickRoughness(surf.n_dot_v, surf.base_reflectivity, roughness); 
-    vec2 envBRDF    = texture(u_brdf_integration_map, vec2(surf.n_dot_v, roughness)).rg;
-    vec3 specular   = prefilteredColor * (F * envBRDF.x + envBRDF.y);
-
-    vec3 kS         = F;
-    vec3 kD         = (1 - kS) * (1 - metalness);
-    vec3 irradiance = texture(u_irradiance_map, surf.normal_vec).rgb;
-    vec3 diffuse    = irradiance * albedo;
-    vec3 ambient    = (kD * diffuse + specular) * ambient_occlusion; 
-    vec3 light      = ambient;
+    // Add contribution from ambient light
+    {
+        vec2 env_brdf = texture(u_brdf_integration_map, vec2(dotp(N,V), roughness)).xy;
+        vec3 F        = F0 + max(1-F0-roughness, 0) * pow(1-dotp(N,V), 5);
+        vec3 specular = (F * env_brdf.x + env_brdf.y) * textureLod(u_reflectance_map, R, roughness * MAX_REFLECTANCE_LOD).rgb;
+        vec3 diffuse  = (1-F) * (1-metalness) * albedo * texture(u_irradiance_map, N).rgb;
+        light         += (diffuse + specular) * ambient_occlusion; 
+    }
 
     // Add contributions from point lights
     vec3 light_positions[4] = {vec3(-3, -3, 8), vec3(3, -3, 8), vec3(3, 3, 8), vec3(-3, 3, 8)};
     vec3 light_colors[4] = {vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79), vec3(23.47, 21.31, 20.79)};
     for(int i=0; i<4; ++i)
     {
-        vec3 L = normalize(light_positions[i] - position);
-        float distance = length(light_positions[i] - position);
-        vec3 radiance  = light_colors[i] / (distance * distance); 
-        light += compute_contribution(surf, L, radiance);
+        // Evaluate light vector and half-angle vector
+        const vec3 L = normalize(light_positions[i] - position);
+        const vec3 H = normalize(V + L);
+
+        // Evaluate radiance of light source at the current distance
+        const vec3 radiance = light_colors[i] / length2(light_positions[i] - position);
+
+        // Evaluate Trowbridge-Reitz GGX normal distribution function
+        const float alpha = roughness*roughness;
+        const float D = alpha*alpha / (PI * pow2(dotp(N,H)*dotp(N,H)*(alpha*alpha-1) + 1));
+
+        // Evaluate Smith's Schlick-GGX geometry function
+        const float G = geometry_smith(N,V,L,(alpha+1)*(alpha+1)/8);
+
+        // Evaluate Fresnel-Schlick approximation to Fresnel equation
+        const vec3 F = F0 + (1-F0) * pow(1-dotp(V,H), 5);
+
+        // Evaluate Cook-Torrance BRDF
+        const vec3 diffuse = (1-F) * (1-metalness) * albedo/PI;
+        const vec3 specular = (D * G * F) / (4 * dotp(N,V) * dotp(N,L) + 0.001);  
+        light += (diffuse + specular) * radiance * dotp(N,L);
     }
     return light;
 }
 )";
-
 
 constexpr char skybox_vert_shader_source[] = R"(
 uniform mat4 u_view_proj_matrix;
@@ -190,109 +176,77 @@ void main()
     f_color = textureLod(u_texture, direction, 1.2);
 })";
 
-constexpr char cubemap_convolution_frag_shader_source[] = R"(
+constexpr char irradiance_frag_shader_source[] = R"(
 uniform samplerCube u_texture;
 layout(location=0) in vec3 direction;
 layout(location=0) out vec4 f_color;
 void main()
 {
-    vec3 normal = normalize(direction);
-    vec3 up = vec3(0,1,0);
-    vec3 right = cross(up, normal);
-    up = cross(normal, right);
+    const mat3 basis = tangent_basis(direction);
 
-    float sampleDelta = 0.01, nrSamples = 0; 
-    vec3 irradiance = vec3(0);
-    for(float phi = 0.0; phi < 2.0 * PI; phi += sampleDelta)
+    vec3 irradiance = vec3(0,0,0);
+    float num_samples = 0; 
+    for(float phi = 0; phi < PI*2; phi += 0.01)
     {
-        for(float theta = 0.0; theta < 0.5 * PI; theta += sampleDelta)
+        for(float theta = 0; theta < PI*0.5; theta += 0.01)
         {
-            // spherical to cartesian (in tangent space)
-            vec3 tangentSample = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
-            // tangent space to world
-            vec3 sampleVec = tangentSample.x * right + tangentSample.y * up + tangentSample.z * normal; 
-
-            irradiance += texture(u_texture, sampleVec).rgb * cos(theta) * sin(theta);
-            nrSamples++;
+            // Sample irradiance from the source texture, and weight by the sampling area
+            vec3 L = basis * spherical(phi, theta);
+            irradiance += texture(u_texture, L).rgb * cos(theta) * sin(theta);
+            num_samples++;
         }
     }
-
-    f_color = vec4(PI * irradiance / nrSamples, 1);
-
+    f_color = vec4(PI * irradiance / num_samples, 1);
 })";
 
-constexpr char importance_sample_ggx[] = R"(
-vec2 hammersley_sequence(uint i, uint N)
+constexpr char importance_sample_ggx[] = R"(  
+vec3 importance_sample_ggx(float alpha, uint i, uint n)
 {
-    // Evaluate Van Der Corpus sequence
-    uint bits = i;
-    bits = (bits << 16u) | (bits >> 16u);
-    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
-    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
-    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
-    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
-    float radical_inverse = float(bits) * 2.3283064365386963e-10; // / 0x100000000
+    // Phi is distributed uniformly over the integration range
+    const float phi = i * 2.0 * PI / n;
 
-    return vec2(float(i)/float(N), radical_inverse);
-}  
-  
-vec3 importance_sample_ggx(vec2 Xi, vec3 N, float roughness)
-{
-    float a = roughness*roughness;
-	
-    float phi = 2.0 * PI * Xi.x;
-    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a*a - 1.0) * Xi.y));
-    float sinTheta = sqrt(1.0 - cosTheta*cosTheta);
-	
-    // from spherical coordinates to cartesian coordinates
-    vec3 H;
-    H.x = cos(phi) * sinTheta;
-    H.y = sin(phi) * sinTheta;
-    H.z = cosTheta;
-	
-    // from tangent-space vector to world-space sample vector
-    vec3 up        = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
-    vec3 tangent   = normalize(cross(up, N));
-    vec3 bitangent = cross(N, tangent);
-	
-    vec3 sampleVec = tangent * H.x + bitangent * H.y + N * H.z;
-    return normalize(sampleVec);
+    // Theta is importance-sampled using the Van Der Corpus sequence
+    i = (i << 16u) | (i >> 16u);
+    i = ((i & 0x55555555u) << 1u) | ((i & 0xAAAAAAAAu) >> 1u);
+    i = ((i & 0x33333333u) << 2u) | ((i & 0xCCCCCCCCu) >> 2u);
+    i = ((i & 0x0F0F0F0Fu) << 4u) | ((i & 0xF0F0F0F0u) >> 4u);
+    i = ((i & 0x00FF00FFu) << 8u) | ((i & 0xFF00FF00u) >> 8u);
+    float radical_inverse = i * 2.3283064365386963e-10; // Divide by 0x100000000
+    float cos_theta = sqrt((1 - radical_inverse) / ((alpha*alpha-1)*radical_inverse + 1));
+    return spherical(phi, cos_theta, sqrt(1 - cos_theta*cos_theta));
 }
 )";
 
-constexpr char prefilter_frag_shader_source[] = R"(
+constexpr char reflectance_frag_shader_source[] = R"(
 uniform samplerCube u_texture;
 uniform float u_roughness;
 layout(location=0) in vec3 direction;
 layout(location=0) out vec4 f_color;
 
 void main()
-{		
-    vec3 N = normalize(direction);    
-    vec3 R = N;
-    vec3 V = R;
+{
+    // As we are evaluating base reflectance, both the normal and view vectors are equal to our sampling direction
+    const vec3 N = normalize(direction), V = N;
+    const mat3 basis = tangent_basis(N);
 
-    const uint SAMPLE_COUNT = 1024u;   
     vec3 sum_color = vec3(0,0,0);
     float sum_weight = 0;     
-    for(uint i = 0u; i < SAMPLE_COUNT; ++i)
+    for(int i=0; i<1024; ++i)
     {
-        vec2 Xi = hammersley_sequence(i, SAMPLE_COUNT);
-        vec3 H  = importance_sample_ggx(Xi, N, u_roughness);
-        vec3 L  = normalize(2.0 * dot(V, H) * H - V);
+        // For the desired roughness, sample possible half-angle vectors, and compute the lighting vector from them
+        vec3 H = basis * importance_sample_ggx(u_roughness*u_roughness, i, 1024);
+        vec3 L = normalize(2 * dot(V, H) * H - V);
+        if(dot(N, L) <= 0) continue;
 
-        float n_dot_l = dot(N, L);
-        if(n_dot_l > 0)
-        {
-            sum_color += texture(u_texture, L).rgb * n_dot_l;
-            sum_weight += n_dot_l;
-        }
+        // Sample the environment map according to the lighting direction, and weight the resulting contribution by N dot L
+        sum_color += texture(u_texture, L).rgb * dot(N, L);
+        sum_weight += dot(N, L);
     }
 
     f_color = vec4(sum_color/sum_weight, 1);
 })";
 
-constexpr char brdf_integration_vert_shader_source[] = R"(
+constexpr char fullscreen_pass_vert_shader_source[] = R"(
 layout(location=0) in vec2 v_position;
 layout(location=1) in vec2 v_texcoords;
 layout(location=0) out vec2 texcoords;
@@ -306,78 +260,43 @@ constexpr char brdf_integration_frag_shader_source[] = R"(
 layout(location=0) in vec2 texcoords;
 layout(location=0) out vec4 f_color;
 
-float GeometrySchlickGGX(float NdotV, float roughness)
+vec2 integrate_brdf(float n_dot_v, float roughness)
 {
-    float a = roughness;
-    float k = (a * a) / 2.0;
+    // Without loss of generality, evaluate the case where the normal is aligned with the z-axis and the viewing direction is in the xz-plane
+    const vec3 N = vec3(0,0,1);
+    const vec3 V = vec3(sqrt(1 - n_dot_v*n_dot_v), 0, n_dot_v);
 
-    float nom   = NdotV;
-    float denom = NdotV * (1.0 - k) + k;
-
-    return nom / denom;
-}
-// ----------------------------------------------------------------------------
-float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
-{
-    float NdotV = max(dot(N, V), 0.0);
-    float NdotL = max(dot(N, L), 0.0);
-    float ggx2 = GeometrySchlickGGX(NdotV, roughness);
-    float ggx1 = GeometrySchlickGGX(NdotL, roughness);
-
-    return ggx1 * ggx2;
-}
-
-vec2 IntegrateBRDF(float NdotV, float roughness)
-{
-    vec3 V;
-    V.x = sqrt(1.0 - NdotV*NdotV);
-    V.y = 0.0;
-    V.z = NdotV;
-
-    float A = 0.0;
-    float B = 0.0;
-
-    vec3 N = vec3(0.0, 0.0, 1.0);
-
-    const uint SAMPLE_COUNT = 1024u;
-    for(uint i = 0u; i < SAMPLE_COUNT; ++i)
+    vec2 result = vec2(0,0);    
+    for(int i=0; i<1024; ++i)
     {
-        vec2 Xi = hammersley_sequence(i, SAMPLE_COUNT);
-        vec3 H  = importance_sample_ggx(Xi, N, roughness);
-        vec3 L  = normalize(2.0 * dot(V, H) * H - V);
+        // For the desired roughness, sample possible half-angle vectors, and compute the lighting vector from them
+        vec3 H = importance_sample_ggx(roughness*roughness, i, 1024);
+        vec3 L = normalize(2 * dot(V, H) * H - V);
+        if(dot(N, L) <= 0) continue;
 
-        float NdotL = max(L.z, 0.0);
-        float NdotH = max(H.z, 0.0);
-        float VdotH = max(dot(V, H), 0.0);
-
-        if(NdotL > 0.0)
-        {
-            float G = GeometrySmith(N, V, L, roughness);
-            float G_Vis = (G * VdotH) / (NdotH * NdotV);
-            float Fc = pow(1.0 - VdotH, 5.0);
-
-            A += (1.0 - Fc) * G_Vis;
-            B += Fc * G_Vis;
-        }
+        // Integrate results
+        const float Fc = pow(1 - dotp(V,H), 5);
+        const float G = geometry_smith(N,V,L,roughness*roughness/2);
+        const float G_Vis = (G * dotp(V,H)) / (dotp(N,H) * n_dot_v);
+        result.x += (1 - Fc) * G_Vis;
+        result.y += Fc * G_Vis;
     }
-    A /= float(SAMPLE_COUNT);
-    B /= float(SAMPLE_COUNT);
-    return vec2(A, B);
+    return result/1024;
 }
 void main() 
 {
-    f_color = vec4(IntegrateBRDF(texcoords.x, texcoords.y), 0, 1);
+    f_color = vec4(integrate_brdf(texcoords.x, texcoords.y), 0, 1);
 })";
 
 pbr_tools::pbr_tools()
 {
-    GLuint skybox_vert_shader  = compile_shader(GL_VERTEX_SHADER, {preamble, skybox_vert_shader_source});
-    spheremap_skybox_prog      = link_program({skybox_vert_shader, compile_shader(GL_FRAGMENT_SHADER, {preamble, spheremap_skybox_frag_shader_source})});
-    cubemap_skybox_prog        = link_program({skybox_vert_shader, compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_skybox_frag_shader_source})});
-    cubemap_convolution_prog   = link_program({skybox_vert_shader, compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_convolution_frag_shader_source})});
-    prefilter_prog             = link_program({skybox_vert_shader, compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, prefilter_frag_shader_source})});
-    brdf_integration_prog      = link_program({compile_shader(GL_VERTEX_SHADER, {preamble, brdf_integration_vert_shader_source}), 
-                                               compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, brdf_integration_frag_shader_source})});
+    GLuint skybox_vs           = compile_shader(GL_VERTEX_SHADER, {preamble, skybox_vert_shader_source});
+    GLuint fullscreen_pass_vs  = compile_shader(GL_VERTEX_SHADER, {preamble, fullscreen_pass_vert_shader_source});
+    spheremap_skybox_prog      = link_program({skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, spheremap_skybox_frag_shader_source})});
+    cubemap_skybox_prog        = link_program({skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, cubemap_skybox_frag_shader_source})});
+    irradiance_prog            = link_program({skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, irradiance_frag_shader_source})});
+    reflectance_prog           = link_program({skybox_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, reflectance_frag_shader_source})});
+    brdf_integration_prog      = link_program({fullscreen_pass_vs, compile_shader(GL_FRAGMENT_SHADER, {preamble, importance_sample_ggx, brdf_integration_frag_shader_source})});
 }
 
 template<class F> GLuint render_cubemap(GLsizei levels, GLenum internal_format, GLsizei width, F draw_face)
@@ -440,11 +359,11 @@ GLuint pbr_tools::convert_spheremap_to_cubemap(GLenum internal_format, GLsizei w
 
 GLuint pbr_tools::compute_irradiance_map(GLuint cubemap) const
 {
+    glUseProgram(irradiance_prog);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
     return render_cubemap(1, GL_RGB16F, 32, [&](const float4x4 & view_proj_matrix, int mip)
     {
-        glUseProgram(cubemap_convolution_prog);
-        glUniformMatrix4fv(glGetUniformLocation(cubemap_convolution_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+        glUniformMatrix4fv(glGetUniformLocation(irradiance_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
         glBegin(GL_QUADS);
         for(auto & v : skybox_verts) glVertex3fv(&v[0]);
         glEnd();
@@ -453,12 +372,12 @@ GLuint pbr_tools::compute_irradiance_map(GLuint cubemap) const
 
 GLuint pbr_tools::compute_reflectance_map(GLuint cubemap) const
 {
+    glUseProgram(reflectance_prog);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
     return render_cubemap(5, GL_RGB16F, 128, [&](const float4x4 & view_proj_matrix, int mip)
     {
-        glUseProgram(prefilter_prog);
-        glUniformMatrix4fv(glGetUniformLocation(prefilter_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
-        glUniform1f(glGetUniformLocation(prefilter_prog, "u_roughness"), mip/4.0f);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+        glUniformMatrix4fv(glGetUniformLocation(reflectance_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+        glUniform1f(glGetUniformLocation(reflectance_prog, "u_roughness"), mip/4.0f);
         glBegin(GL_QUADS);
         for(auto & v : skybox_verts) glVertex3fv(&v[0]);
         glEnd();
@@ -495,10 +414,10 @@ GLuint pbr_tools::compute_brdf_integration_map() const
     return brdf_integration_map;
 }
 
-void pbr_tools::draw_skybox(GLuint cubemap, const float4x4 & view_proj_matrix) const
+void pbr_tools::draw_skybox(GLuint cubemap, const float4x4 & skybox_view_proj_matrix) const
 {
     glUseProgram(cubemap_skybox_prog);
-    glUniformMatrix4fv(glGetUniformLocation(cubemap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &view_proj_matrix[0][0]);
+    glUniformMatrix4fv(glGetUniformLocation(cubemap_skybox_prog, "u_view_proj_matrix"), 1, GL_FALSE, &skybox_view_proj_matrix[0][0]);
     glUniform1i(glGetUniformLocation(cubemap_skybox_prog, "u_texture"), 0);
     glBindTextureUnit(0, cubemap);
     glDepthMask(GL_FALSE);
