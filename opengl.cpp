@@ -225,7 +225,7 @@ vec3 importance_sample_ggx(float alpha, uint i, uint n)
     i = ((i & 0x33333333u) << 2u) | ((i & 0xCCCCCCCCu) >> 2u);
     i = ((i & 0x0F0F0F0Fu) << 4u) | ((i & 0xF0F0F0F0u) >> 4u);
     i = ((i & 0x00FF00FFu) << 8u) | ((i & 0xFF00FF00u) >> 8u);
-    float radical_inverse = i * 2.3283064365386963e-10; // Divide by 0x100000000
+    float radical_inverse = float(i) * 2.3283064365386963e-10; // Divide by 0x100000000
     float cos_theta = sqrt((1 - radical_inverse) / ((alpha*alpha-1)*radical_inverse + 1));
     return spherical(phi, cos_theta, sqrt(1 - cos_theta*cos_theta));
 }
